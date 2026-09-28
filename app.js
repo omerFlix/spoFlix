@@ -14,8 +14,17 @@ const state = {
   audiusHost: null, currentGenre: null, isLoadingMore: false, loadedTrackIds: new Set(),
   playToken: 0,
   lyricLines: [], lyricTrackId: null, activeLyricIndex: -1, lyricRequestId: 0, lyricOffsets: {},
-  nightcoreOn: localStorage.getItem('spoflix_nightcore') === 'true',
-  boostGain: parseFloat(localStorage.getItem('spoflix_boost') || '1'),
+  audioMode: localStorage.getItem('spoflix_audio_mode') || 'normal',
+  isBoosted: localStorage.getItem('spoflix_boost') === 'true',
+  boostMultiplier: 2.5,
+  currentVideo: null,
+  currentVideoPlayer: null,
+  videoPlaybackToken: 0,
+  currentVideoCategory: 'all',
+  videoSearchTimeout: null,
+  searchTab: 'all',
+  searchVideos: [],
+  searchQuery: '',
 };
 
 // ── IndexedDB ──
@@ -36,114 +45,266 @@ function saveSongToDB(s) { return new Promise((resolve,reject)=>{const t=db.tran
 function getSongsFromDB() { return new Promise((resolve,reject)=>{const t=db.transaction(['songs'],'readonly'),o=t.objectStore('songs'),r=o.getAll();r.onsuccess=()=>resolve(r.result);r.onerror=e=>reject(e);}); }
 function deleteSongFromDB(id) { return new Promise((resolve,reject)=>{const t=db.transaction(['songs'],'readwrite'),o=t.objectStore('songs'),r=o.delete(id);r.onsuccess=()=>resolve();r.onerror=e=>reject(e);}); }
 
-// ── Audio Player ──
+// ── Audio Player & Web Audio API Engine ──
 const audio = new Audio();
-audio.volume = state.volume;
-audio.setAttribute('playsinline', '');
-audio.setAttribute('webkit-playsinline', '');
-audio.preload = 'auto';
+audio.crossOrigin = 'anonymous';
+audio.volume = 1.0; // HTMLMediaElement 1.0 tutulur, tüm ses seviyesi ve boost GainNode üzerinden yönetilir
+
 let audioContext = null;
-let audioAnalyser = null;
 let audioSource = null;
-let audioMotionFrame = null;
-let audioModeInput = null;
+let subBassFilter = null;
 let bassFilter = null;
-let stereoPanner = null;
-let boostGainNode = null;
-const MAX_BOOST = 1.5;
+let trebleFilter = null;
+let audioModeGain = null;
+let masterGain = null;
+let dynamicsCompressor = null;
+let audioAnalyser = null;
+let audioMotionFrame = null;
 
-function connectAudioMode() {
-  if (!audioSource || !audioAnalyser) return;
-  audioSource.disconnect();
-  audioAnalyser.disconnect();
-  if (audioModeInput) audioModeInput.disconnect();
-  if (bassFilter) bassFilter.disconnect();
-  if (stereoPanner) stereoPanner.disconnect();
-  if (boostGainNode) boostGainNode.disconnect();
-
-  audioModeInput = audioContext.createGain();
-  bassFilter = audioContext.createBiquadFilter();
-  stereoPanner = audioContext.createStereoPanner();
-  boostGainNode = audioContext.createGain();
-  bassFilter.type = 'lowshelf';
-  bassFilter.frequency.value = 180;
-  bassFilter.gain.value = 0;
-  stereoPanner.pan.value = 0;
-  boostGainNode.gain.value = state.boostGain;
-
-  audioSource.connect(audioModeInput);
-  audioModeInput.connect(boostGainNode);
-  boostGainNode.connect(audioAnalyser);
-  audioAnalyser.connect(audioContext.destination);
-  audio.playbackRate = state.nightcoreOn ? 1.15 : 1;
+// iOS Safari / WebKit Arka Plan Ses Desteği
+if ('audioSession' in navigator) {
+  try {
+    navigator.audioSession.type = 'playback';
+  } catch (e) {
+    console.warn('audioSession init error:', e);
+  }
 }
 
-function openAudioModesSheet() {
-  const modal = document.getElementById('audioModesModal');
-  if (!modal) return;
-  modal.hidden = false;
-  document.querySelector('.modes-nav')?.setAttribute('aria-expanded', 'true');
+function initAudioEngine() {
+  if (audioContext) {
+    if (audioContext.state === 'suspended') {
+      audioContext.resume().catch(() => {});
+    }
+    return;
+  }
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    audioContext = new AudioCtx();
+    if (audioContext.state === 'suspended') {
+      audioContext.resume().catch(() => {});
+    }
+    audioSource = audioContext.createMediaElementSource(audio);
+
+    // 1. Sub-bass vuruş filtresi (75 Hz derin bas gücü)
+    subBassFilter = audioContext.createBiquadFilter();
+    subBassFilter.type = 'peaking';
+    subBassFilter.frequency.value = 75;
+    subBassFilter.Q.value = 1.3;
+    subBassFilter.gain.value = 0;
+
+    // 2. Bas gövdesi filtresi (130 Hz zengin bas)
+    bassFilter = audioContext.createBiquadFilter();
+    bassFilter.type = 'lowshelf';
+    bassFilter.frequency.value = 130;
+    bassFilter.gain.value = 0;
+
+    // 3. Tiz filtresi (3400 Hz berraklık)
+    trebleFilter = audioContext.createBiquadFilter();
+    trebleFilter.type = 'highshelf';
+    trebleFilter.frequency.value = 3400;
+    trebleFilter.gain.value = 0;
+
+    audioModeGain = audioContext.createGain();
+    audioModeGain.gain.value = 1.0;
+
+    masterGain = audioContext.createGain();
+    masterGain.gain.value = 1.0;
+
+    // Gerçek Tepe Limiter (Peak Limiter):
+    // Eşiği -1.5 dB yaparak basların ve boost'un boğulmasını önler; sadece hoparlör distorsiyonunu engeller.
+    dynamicsCompressor = audioContext.createDynamicsCompressor();
+    dynamicsCompressor.threshold.value = -1.5;
+    dynamicsCompressor.knee.value = 18;
+    dynamicsCompressor.ratio.value = 8;
+    dynamicsCompressor.attack.value = 0.003;
+    dynamicsCompressor.release.value = 0.15;
+
+    audioAnalyser = audioContext.createAnalyser();
+    audioAnalyser.fftSize = 128;
+
+    // Bağlantı Grafiği:
+    // audioSource -> subBassFilter -> bassFilter -> trebleFilter -> audioModeGain -> masterGain -> compressor -> audioAnalyser -> destination
+    audioSource.connect(subBassFilter);
+    subBassFilter.connect(bassFilter);
+    bassFilter.connect(trebleFilter);
+    trebleFilter.connect(audioModeGain);
+    audioModeGain.connect(masterGain);
+    masterGain.connect(dynamicsCompressor);
+    dynamicsCompressor.connect(audioAnalyser);
+    audioAnalyser.connect(audioContext.destination);
+
+    applyAudioModeSettings();
+    applyVolumeSettings();
+  } catch (err) {
+    console.warn('initAudioEngine error (fallback native audio):', err);
+  }
+}
+
+function applyAudioModeSettings() {
+  const mode = state.audioMode || 'normal';
+  let rate = 1.0;
+
+  if (bassFilter && subBassFilter && trebleFilter && audioModeGain) {
+    if (mode === 'boost') {
+      subBassFilter.gain.value = 4;
+      bassFilter.gain.value = 4;
+      trebleFilter.gain.value = 3;
+      audioModeGain.gain.value = 1.5;
+      rate = 1.0;
+    } else if (mode === 'bass') {
+      subBassFilter.gain.value = 8;   // +8dB derin sub-bass vuruşu
+      bassFilter.gain.value = 14;     // +14dB güçlü bas gövdesi
+      trebleFilter.gain.value = 1;
+      audioModeGain.gain.value = 1.25;
+      rate = 1.0;
+    } else if (mode === 'nightcore') {
+      subBassFilter.gain.value = -2;
+      bassFilter.gain.value = -1;
+      trebleFilter.gain.value = 4;
+      audioModeGain.gain.value = 1.1;
+      rate = 1.18;
+    } else {
+      subBassFilter.gain.value = 0;
+      bassFilter.gain.value = 0;
+      trebleFilter.gain.value = 0;
+      audioModeGain.gain.value = 1.0;
+      rate = 1.0;
+    }
+  }
+
+  audio.playbackRate = rate;
+  if (state.playbackMode === 'youtube' && ytPlayer && ytPlayer.setPlaybackRate) {
+    ytPlayer.setPlaybackRate(mode === 'nightcore' ? 1.25 : 1);
+  }
+}
+
+function applyVolumeSettings() {
+  initAudioEngine();
+  const boost = state.isBoosted ? state.boostMultiplier : 1.0;
+  const modeBoost = state.audioMode === 'boost' ? 1.4 : (state.audioMode === 'bass' ? 1.15 : 1.0);
+  const effectiveGain = state.isMuted ? 0 : (state.volume * boost * modeBoost);
+
+  // 1. HTML5 Audio (GainNode üzerinden ses yönetimi)
+  if (masterGain && audioContext) {
+    try {
+      if (audioContext.state === 'suspended') {
+        audioContext.resume().catch(() => {});
+      }
+      masterGain.gain.setTargetAtTime(effectiveGain, audioContext.currentTime, 0.015);
+      audio.volume = 1.0;
+    } catch (e) {
+      audio.volume = Math.min(1.0, state.volume);
+    }
+  } else {
+    audio.volume = Math.min(1.0, state.volume);
+  }
+
+  // 2. YouTube Iframe API temel ses düzeyi
+  if (ytPlayerReady && ytPlayer && ytPlayer.setVolume) {
+    const ytVol = state.isMuted ? 0 : Math.min(100, Math.round(state.volume * 100));
+    ytPlayer.setVolume(ytVol);
+  }
+
+  // 3. Electron IPC Booster: YouTube iframelerindeki video sesini doğrudan %250'ye kadar katla
+  try {
+    if (window.require) {
+      const { ipcRenderer } = window.require('electron');
+      if (ipcRenderer && ipcRenderer.send) {
+        ipcRenderer.send('set-volume-boost', {
+          multiplier: effectiveGain,
+          mode: state.audioMode
+        });
+      }
+    }
+  } catch (err) {}
+
+  // 4. Doğrudan DOM iframe video elemanlarına AudioContext Gain bağla (webSecurity: false)
+  try {
+    const frames = document.querySelectorAll('iframe');
+    for (const frame of frames) {
+      const win = frame.contentWindow;
+      if (!win) continue;
+      const video = win.document?.querySelector('video');
+      if (video) {
+        if (!win._spoflixCtx) {
+          const AudioCtx = win.AudioContext || win.webkitAudioContext;
+          win._spoflixCtx = new AudioCtx();
+          win._spoflixSource = win._spoflixCtx.createMediaElementSource(video);
+          win._spoflixGain = win._spoflixCtx.createGain();
+          win._spoflixSource.connect(win._spoflixGain);
+          win._spoflixGain.connect(win._spoflixCtx.destination);
+        }
+        if (win._spoflixCtx.state === 'suspended') win._spoflixCtx.resume();
+        win._spoflixGain.gain.value = effectiveGain;
+      }
+    }
+  } catch (err) {}
+
+  updateVolumeUI();
+}
+
+function toggleBoost() {
+  initAudioEngine();
+  state.isBoosted = !state.isBoosted;
+  localStorage.setItem('spoflix_boost', String(state.isBoosted));
+  applyVolumeSettings();
+  if (state.isBoosted) {
+    showToast('Ses Artırma (Boost 🔥) Açıldı! (+%80 Ekstra Güç)');
+  } else {
+    showToast('Standart Ses Düzeyine Geçildi');
+  }
+}
+
+function toggleAudioModes() {
+  const panel = document.getElementById('audioModesPanel');
+  const headerMenu = document.getElementById('headerAudioModesMenu');
+  const button = document.querySelector('.modes-nav');
+  
+  if (headerMenu) {
+    headerMenu.hidden = !headerMenu.hidden;
+  }
+  if (panel) {
+    panel.hidden = !panel.hidden;
+    button?.setAttribute('aria-expanded', String(!panel.hidden));
+  }
   updateAudioModeUI();
-}
-
-function closeAudioModesSheet() {
-  const modal = document.getElementById('audioModesModal');
-  if (!modal) return;
-  modal.hidden = true;
-  document.querySelector('.modes-nav')?.setAttribute('aria-expanded', 'false');
 }
 
 function updateAudioModeUI() {
-  const toggle = document.getElementById('nightcoreToggle');
-  if (toggle) {
-    toggle.classList.toggle('active', state.nightcoreOn);
-    toggle.setAttribute('aria-pressed', String(state.nightcoreOn));
-  }
-  const boostSlider = document.getElementById('boostSlider');
-  const boostFill = document.getElementById('boostFill');
-  const boostValue = document.getElementById('boostValue');
-  if (boostSlider) boostSlider.value = Math.round(state.boostGain * 100);
-  if (boostFill) boostFill.style.width = `${(state.boostGain / MAX_BOOST) * 100}%`;
-  if (boostValue) boostValue.textContent = `${Math.round(state.boostGain * 100)}%`;
+  document.querySelectorAll('.audio-mode-option').forEach((option) => {
+    option.classList.toggle('active', option.dataset.audioMode === state.audioMode);
+  });
+  document.querySelectorAll('.settings-mode-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.mode === state.audioMode);
+  });
+  const modeSelect = document.getElementById('settingsAudioModeSelect');
+  if (modeSelect) modeSelect.value = state.audioMode;
 }
 
-function toggleNightcore() {
-  state.nightcoreOn = !state.nightcoreOn;
-  localStorage.setItem('spoflix_nightcore', String(state.nightcoreOn));
-  if (state.playbackMode === 'youtube' && ytPlayer) {
-    if (ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(state.nightcoreOn ? 1.25 : 1);
-  } else if (audioContext) {
-    audio.playbackRate = state.nightcoreOn ? 1.15 : 1;
-  } else {
-    audio.playbackRate = state.nightcoreOn ? 1.15 : 1;
-  }
-  updateAudioModeUI();
-  showToast(state.nightcoreOn ? 'Nightcore açık' : 'Nightcore kapalı');
-}
+function setAudioMode(mode) {
+  const allowedModes = ['normal', 'boost', 'bass', 'nightcore'];
+  if (!allowedModes.includes(mode)) return;
+  initAudioEngine();
+  state.audioMode = mode;
+  localStorage.setItem('spoflix_audio_mode', mode);
 
-function setBoostGain(percent) {
-  const clamped = Math.max(50, Math.min(150, percent));
-  state.boostGain = clamped / 100;
-  localStorage.setItem('spoflix_boost', String(state.boostGain));
-  if (boostGainNode) {
-    boostGainNode.gain.setTargetAtTime(state.boostGain, audioContext.currentTime, 0.05);
-  }
+  applyAudioModeSettings();
+  applyVolumeSettings();
   updateAudioModeUI();
+
+  const modeNames = {
+    normal: 'Standart',
+    boost: 'Ses Artırma (Boost 🔥 +%150)',
+    bass: 'Bas Artırma (Bass Boost ⚡ Güçlü Bas)',
+    nightcore: 'Nightcore 🌙'
+  };
+  showToast('Ses Modu: ' + (modeNames[mode] || mode));
 }
 
 function startAudioMotion() {
-  if (!audioAnalyser) {
-    try {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      audioAnalyser = audioContext.createAnalyser();
-      audioAnalyser.fftSize = 128;
-      audioSource = audioContext.createMediaElementSource(audio);
-      connectAudioMode();
-    } catch (error) {
-      audioAnalyser = null;
-    }
-  }
-  audioContext?.resume?.();
+  initAudioEngine();
+  audioContext?.resume?.().catch(() => {});
   cancelAnimationFrame(audioMotionFrame);
   const data = audioAnalyser ? new Uint8Array(audioAnalyser.frequencyBinCount) : null;
   const animate = () => {
@@ -195,7 +356,10 @@ async function audiusFetch(e,p={}) {
   for (const[k,v] of Object.entries(p)) url.searchParams.append(k,v);
   try { const r=await fetch(url); if(!r.ok) throw new Error(`HTTP ${r.status}`); return (await r.json()).data; } catch(e) { console.error('Audius error:',e); return []; }
 }
-function getDefaultArtwork() { return 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="%23242438" width="100" height="100"/><text y="60" x="30" font-size="40">🎵</text></svg>'; }
+function getDefaultArtwork() {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="#242438" width="100" height="100"/><text y="60" x="30" font-size="40">♫</text></svg>';
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
 function mapAudiusTrack(track) {
   const art = track.artwork || {};
   // host null/undefined ise fallback yap; async getAudiusHost() cachelenmedi ise bozuk URL olur
@@ -212,8 +376,8 @@ function mapITunesTrack(track) {
   const l=track.artworkUrl100?track.artworkUrl100.replace('100x100','600x600'):getDefaultArtwork(),s=track.artworkUrl100||getDefaultArtwork();
   return { id:'itunes_'+track.trackId, name:track.trackName||'Bilinmeyen Şarkı', artist:track.artistName||'Bilinmeyen Sanatçı', album:track.collectionName||'Single', artwork:l, artworkSmall:s, previewUrl:track.previewUrl||'', duration:Math.round((track.trackTimeMillis||0)/1000), genre:track.primaryGenreName||'', isFullSong:false };
 }
-async function searchITunes(q,l=25) {
-  try { const r=await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=${l}`); if(!r.ok) throw new Error(`HTTP ${r.status}`); return (await r.json()).results.map(mapITunesTrack); } catch(e) { console.error('iTunes error:',e); return []; }
+async function searchITunes(q,l=25,country='') {
+  try { const countryParam=country?`&country=${encodeURIComponent(country)}`:''; const r=await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=${l}${countryParam}`); if(!r.ok) throw new Error(`HTTP ${r.status}`); return (await r.json()).results.map(mapITunesTrack); } catch(e) { console.error('iTunes error:',e); return []; }
 }
 async function searchJamendo(q,l=25) {
   try {
@@ -239,20 +403,87 @@ async function searchJamendo(q,l=25) {
     }));
   } catch (e) { console.error('Jamendo error:', e); return []; }
 }
-const YOUTUBE_DATA_API_KEY = 'AIzaSyDUg41_G8SEQZGu9y44Si69VaG3SLX4qMY';
 async function searchYouTube(q,l=10) {
-  if (!YOUTUBE_DATA_API_KEY || YOUTUBE_DATA_API_KEY === 'YOUR_YOUTUBE_DATA_API_KEY') return [];
   try {
-    const url = new URL('https://www.googleapis.com/youtube/v3/search');
-    url.searchParams.set('part', 'snippet'); url.searchParams.set('type', 'video');
-    url.searchParams.set('maxResults', l); url.searchParams.set('q', q); url.searchParams.set('key', YOUTUBE_DATA_API_KEY);
-    const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return (await r.json()).items.filter(item => item.id?.videoId).map(item => ({
-      id: 'youtube_' + item.id.videoId, youtubeId: item.id.videoId, name: item.snippet.title,
-      artist: item.snippet.channelTitle, album: 'YouTube', artwork: item.snippet.thumbnails?.high?.url || getDefaultArtwork(),
-      artworkSmall: item.snippet.thumbnails?.medium?.url || getDefaultArtwork(), previewUrl: '', duration: 0, isFullSong: true
-    }));
+    const url = new URL('/api/youtube', window.location.origin);
+    url.searchParams.set('q', String(q || '').slice(0, 150));
+    url.searchParams.set('limit', String(Math.max(1, Math.min(25, Number(l) || 10))));
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return (await r.json()).items || [];
   } catch (e) { console.error('YouTube search error:', e); return []; }
+}
+
+const TURKISH_CHART_FALLBACK = [
+  ['Kayıp Kalp', 'BLOK3'],
+  ['Sebebi Yar', 'BLOK3'],
+  ['Çok Güzel Gülüyorsun', 'BLOK3, Poizi'],
+  ['Döndüm', 'Bora Duran'],
+  ['Toz Pembe', 'manifest'],
+  ['Hileli', 'manifest, Ajda Pekkan'],
+  ['Kırgınım', 'BLOK3'],
+  ['KUSURA BAKMA', 'BLOK3'],
+  ['Benim Olsana', 'CRUSH'],
+  ['Ara Beni', 'Hadise'],
+  ['Değiştiremezsin Yazılmışsa', 'BLOK3'],
+  ['Gamsız Hayat', 'Candan Erçetin'],
+  ['YIN YANG', 'Motive'],
+  ['Bana Ne Bu Sevdalardan', 'Ezhel'],
+  ['Ha Leylim', 'Mabel Matiz']
+];
+
+async function getTurkishTrendingTracks(limit = 20) {
+  const chartUrl = 'https://rss.applemarketingtools.com/api/v2/tr/music/most-played/25/songs.json';
+  const [chartResult, lvbelTracks, muslimTracks] = await Promise.allSettled([
+    fetch(chartUrl).then((response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    }),
+    searchITunes('Lvbel C5', 6, 'tr'),
+    searchITunes('Müslüm Gürses', 6, 'tr')
+  ]);
+
+  const chartSongs = chartResult.status === 'fulfilled'
+    ? (chartResult.value.feed?.results || []).map((song, index) => ({
+        id: `apple_tr_${song.id || index}`,
+        name: song.name || 'Bilinmeyen Şarkı',
+        artist: song.artistName || 'Bilinmeyen Sanatçı',
+        album: song.albumName || 'Türkiye Trendleri',
+        artwork: (song.artworkUrl100 || getDefaultArtwork()).replace(/\d+x\d+bb\.(jpg|webp)/, '600x600bb.$1'),
+        artworkSmall: song.artworkUrl100 || getDefaultArtwork(),
+        previewUrl: '',
+        appleUrl: song.url || '',
+        duration: 0,
+        isFullSong: false,
+        source: 'apple-tr'
+      }))
+    : [];
+
+  const featured = [
+    ...(lvbelTracks.status === 'fulfilled' ? lvbelTracks.value : []),
+    ...(muslimTracks.status === 'fulfilled' ? muslimTracks.value : [])
+  ].map((track) => ({ ...track, previewUrl: '', source: 'apple-tr' }));
+  const chartTracks = chartSongs.length ? chartSongs : TURKISH_CHART_FALLBACK.map(([name, artist], index) => ({
+    id: `apple_tr_fallback_${index + 1}`,
+    name,
+    artist,
+    album: 'Apple Music Top 100: Türkiye',
+    artwork: getDefaultArtwork(),
+    artworkSmall: getDefaultArtwork(),
+    previewUrl: '',
+    appleUrl: 'https://music.apple.com/tr/playlist/top-100-t%C3%BCrkiye/pl.f3e0d6ef238542609572c18b0de1513b?l=tr',
+    duration: 0,
+    isFullSong: false,
+    source: 'apple-tr-fallback'
+  }));
+  const seen = new Set();
+  const tracks = [...featured, ...chartTracks].filter((track) => {
+    const key = `${track.name}|${track.artist}`.toLocaleLowerCase('tr-TR');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return tracks.slice(0, limit);
 }
 function searchDeezer(q,l=25) {
   return new Promise((resolve)=>{
@@ -315,12 +546,13 @@ function navigateTo(v) {
     },100); 
     populateSearchGenres(); 
   }
+  else if(v==='videos') renderVideoCategory(state.currentVideoCategory || 'all');
   else if(v==='liked') renderLikedSongs();
   else if(v==='library'){ renderRecentlyPlayed(); updateLikedCountDisplay(); }
   else if(v==='upload') renderMySongs();
 }
 function updateBgGradient(v) {
-  const g=document.getElementById('mainBgGradient'),grads={home:'linear-gradient(180deg,rgba(29,185,84,0.15)0%,transparent 100%)',search:'linear-gradient(180deg,rgba(124,58,237,0.15)0%,transparent 100%)',library:'linear-gradient(180deg,rgba(59,130,246,0.15)0%,transparent 100%)',liked:'linear-gradient(180deg,rgba(124,58,237,0.2)0%,transparent 100%)',playlist:'linear-gradient(180deg,rgba(29,185,84,0.2)0%,transparent 100%)',upload:'linear-gradient(180deg,rgba(233,30,140,0.15)0%,transparent 100%)'};
+  const g=document.getElementById('mainBgGradient'),grads={home:'linear-gradient(180deg,rgba(29,185,84,0.15)0%,transparent 100%)',videos:'linear-gradient(180deg,rgba(124,58,237,0.25)0%,transparent 100%)',search:'linear-gradient(180deg,rgba(124,58,237,0.15)0%,transparent 100%)',library:'linear-gradient(180deg,rgba(59,130,246,0.15)0%,transparent 100%)',liked:'linear-gradient(180deg,rgba(124,58,237,0.2)0%,transparent 100%)',playlist:'linear-gradient(180deg,rgba(29,185,84,0.2)0%,transparent 100%)',upload:'linear-gradient(180deg,rgba(233,30,140,0.15)0%,transparent 100%)'};
   g.style.background=grads[v]||grads.home;
 }
 
@@ -331,25 +563,212 @@ function handleSearch(q) {
   const spi = document.getElementById('searchPageInput');
   if (si && si.value !== q) si.value = q;
   if (spi && spi.value !== q) spi.value = q;
-  if(state.currentView!=='search'){ navigateTo('search'); }
-  const rd=document.getElementById('searchResults'); if(!rd) return;
-  if(q.length<2){ rd.innerHTML='<div class="section-header"><h2 class="section-title">Popüler Aramalar</h2></div><div class="genre-grid" id="searchGenreGrid"></div>'; populateSearchGenres(); return; }
-  state.searchTimeout=setTimeout(async()=>{
-    rd.innerHTML='<div class="loading-spinner"><div class="spinner"></div></div>';
-    const [yR,jR,iR,dR,aR]=await Promise.all([searchYouTube(q,10),searchJamendo(q,25),searchITunes(q,25),searchDeezer(q,25),searchAudius(q,25)]);
-    const ql=q.toLowerCase().trim();
-    const n=(s)=>(s||'').toLowerCase().replace(/[\s\p{P}\p{M}]/gu,'').normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-    const qn=n(ql);
-    const isSub=(qt,t)=>{ let qi=0; for(let ti=0;ti<t.length&&qi<qt.length;ti++){ if(t[ti]===qt[qi]) qi++; } return qi===qt.length; };
-    const score=(t)=>{ const a=(t.artist||'').toLowerCase(),nm=(t.name||'').toLowerCase(),an=n(a),nn=n(nm); if(a===ql)return 6; if(an===qn)return 5; if(a.includes(ql))return 4; if(an.includes(qn))return 3; if(isSub(qn,an))return 2; if(nm.includes(ql)||nn.includes(qn))return 1; return 0; };
-    const fs=(t)=>t.map(t=>({track:t,score:score(t)})).filter(s=>s.score>0).sort((a,b)=>b.score-a.score).map(s=>s.track);
-    const fY=yR,fJ=fs(jR),fI=fs(iR),fD=fs(dR),fA=fs(aR);
-    const seen=new Set(); let tracks=[...fA,...fJ,...fY,...fD,...fI].filter(t=>{const k=`${(t.artist||'').toLowerCase()}|${(t.name||'').toLowerCase()}`;if(seen.has(k))return false;seen.add(k);return true;});
+  if (state.currentView !== 'search') { navigateTo('search'); }
+  const rd = document.getElementById('searchResults'); if (!rd) return;
+  state.searchQuery = q;
+
+  if (q.length < 2) {
+    state.currentPlaylistTracks = [];
+    state.searchVideos = [];
+    rd.innerHTML = '<div class="section-header"><h2 class="section-title">Popüler Aramalar</h2></div><div class="genre-grid" id="searchGenreGrid"></div>';
+    populateSearchGenres();
+    return;
+  }
+
+  state.searchTimeout = setTimeout(async () => {
+    rd.innerHTML = '<div class="loading-spinner"><div class="spinner"></div></div>';
+    const [yR, jR, iR, dR, aR] = await Promise.all([
+      searchYouTube(q, 12),
+      searchJamendo(q, 25),
+      searchITunes(q, 25),
+      searchDeezer(q, 25),
+      searchAudius(q, 25)
+    ]);
+    const ql = q.toLowerCase().trim();
+    const n = (s) => (s || '').toLowerCase().replace(/[\s\p{P}\p{M}]/gu, '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const qn = n(ql);
+    const isSub = (qt, t) => { let qi = 0; for (let ti = 0; ti < t.length && qi < qt.length; ti++) { if (t[ti] === qt[qi]) qi++; } return qi === qt.length; };
+    const score = (t) => { const a = (t.artist || '').toLowerCase(), nm = (t.name || '').toLowerCase(), an = n(a), nn = n(nm); if (a === ql) return 6; if (an === qn) return 5; if (a.includes(ql)) return 4; if (an.includes(qn)) return 3; if (isSub(qn, an)) return 2; if (nm.includes(ql) || nn.includes(qn)) return 1; return 0; };
+    const fs = (t) => t.map(t => ({ track: t, score: score(t) })).filter(s => s.score > 0).sort((a, b) => b.score - a.score).map(s => s.track);
+    const fY = yR, fJ = fs(jR), fI = fs(iR), fD = fs(dR), fA = fs(aR);
+    const seen = new Set();
+    let tracks = [...fA, ...fJ, ...fY, ...fD, ...fI].filter(t => {
+      const k = `${(t.artist || '').toLowerCase()}|${(t.name || '').toLowerCase()}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
     tracks = tracks.filter(t => t.isFullSong || t.id.startsWith('local_'));
-    if(tracks.length===0){ rd.innerHTML='<div class="empty-state"><div class="empty-state-icon">🎧</div><h3 class="empty-state-title">Tam sürüm bulunamadı</h3><p class="empty-state-text">"'+escapeHtml(q)+'" için yalnızca kısa önizlemeler bulundu. Tam sürüm için Audius kaynağı gerekiyor.</p></div>'; return; }
-    state.currentPlaylistTracks=tracks; state.currentGenre=q;
-    rd.innerHTML='<div class="section-header"><h2 class="section-title">Sonuçlar</h2><span class="section-see-all">'+tracks.length+' şarkı</span></div><div class="track-list"><div class="track-list-header"><span>#</span><span>Başlık</span><span>Albüm</span><span>Süre</span></div>'+tracks.map((t,i)=>renderTrackListItem(t,i, 'search')).join('')+'</div>';
-  },400);
+
+    // Video klipleri hazırla
+    let videos = (yR || []).map(item => ({
+      id: item.id,
+      youtubeId: item.youtubeId,
+      title: item.name,
+      channel: item.artist,
+      duration: 'HD Klip',
+      category: 'search',
+      views: 'YouTube',
+      thumbnail: item.artwork || getDefaultArtwork(),
+      desc: item.name
+    }));
+
+    // Küratörlü videolardan da uyuşan varsa başa ekle
+    const curatedMatches = CURATED_VIDEOS.filter(v =>
+      v.title.toLowerCase().includes(ql) ||
+      v.channel.toLowerCase().includes(ql) ||
+      (v.desc && v.desc.toLowerCase().includes(ql))
+    );
+    if (curatedMatches.length > 0) {
+      const vSeen = new Set(videos.map(v => v.youtubeId));
+      for (const cv of curatedMatches) {
+        if (!vSeen.has(cv.youtubeId)) {
+          videos.unshift(cv);
+          vSeen.add(cv.youtubeId);
+        }
+      }
+    }
+
+    state.currentPlaylistTracks = tracks;
+    state.searchVideos = videos;
+    state.currentGenre = q;
+
+    renderSearchResults();
+  }, 400);
+}
+
+function setSearchTab(tab) {
+  state.searchTab = tab;
+  renderSearchResults();
+}
+
+function renderSearchResults() {
+  const rd = document.getElementById('searchResults');
+  if (!rd) return;
+  const tracks = state.currentPlaylistTracks || [];
+  const videos = state.searchVideos || [];
+  const currentTab = state.searchTab || 'all';
+
+  if (tracks.length === 0 && videos.length === 0) {
+    rd.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">🎧</div>
+        <h3 class="empty-state-title">Sonuç bulunamadı</h3>
+        <p class="empty-state-text">"${escapeHtml(state.searchQuery || '')}" için şarkı veya video klip bulunamadı. Farklı bir arama deneyin.</p>
+      </div>`;
+    return;
+  }
+
+  let html = `
+    <div class="search-category-tabs">
+      <button type="button" class="search-tab-pill ${currentTab === 'all' ? 'active' : ''}" onclick="setSearchTab('all')">✨ Tümü</button>
+      <button type="button" class="search-tab-pill ${currentTab === 'songs' ? 'active' : ''}" onclick="setSearchTab('songs')">🎵 Şarkılar (${tracks.length})</button>
+      <button type="button" class="search-tab-pill ${currentTab === 'videos' ? 'active' : ''}" onclick="setSearchTab('videos')">🎬 Video Klipler (${videos.length})</button>
+    </div>
+  `;
+
+  // 1. Tümü Sekmesi: Önce video klipler, ardından şarkılar
+  if (currentTab === 'all') {
+    if (videos.length > 0) {
+      const topVideos = videos.slice(0, 4);
+      html += `
+        <div class="section-header" style="margin-top: 16px;">
+          <h2 class="section-title">🎬 En İyi Video Klipler</h2>
+          <span class="section-see-all" style="cursor:pointer;" onclick="setSearchTab('videos')">Tüm klipleri gör (${videos.length}) &rarr;</span>
+        </div>
+        <div class="search-video-highlight-grid">
+          ${topVideos.map(v => renderSearchVideoCard(v)).join('')}
+        </div>
+      `;
+    }
+    if (tracks.length > 0) {
+      html += `
+        <div class="section-header" style="margin-top: 24px;">
+          <h2 class="section-title">🎵 Şarkılar</h2>
+          <span class="section-see-all">${tracks.length} şarkı</span>
+        </div>
+        <div class="track-list">
+          <div class="track-list-header"><span>#</span><span>Başlık</span><span>Albüm</span><span>İşlemler & Süre</span></div>
+          ${tracks.map((t, i) => renderTrackListItem(t, i, 'search')).join('')}
+        </div>
+      `;
+    }
+  } else if (currentTab === 'songs') {
+    if (tracks.length === 0) {
+      html += `<div class="empty-state"><p class="empty-state-text">Şarkı bulunamadı.</p></div>`;
+    } else {
+      html += `
+        <div class="section-header" style="margin-top: 16px;">
+          <h2 class="section-title">🎵 Şarkı Sonuçları</h2>
+          <span class="section-see-all">${tracks.length} şarkı</span>
+        </div>
+        <div class="track-list">
+          <div class="track-list-header"><span>#</span><span>Başlık</span><span>Albüm</span><span>İşlemler & Süre</span></div>
+          ${tracks.map((t, i) => renderTrackListItem(t, i, 'search')).join('')}
+        </div>
+      `;
+    }
+  } else if (currentTab === 'videos') {
+    if (videos.length === 0) {
+      html += `<div class="empty-state"><p class="empty-state-text">Video klip bulunamadı.</p></div>`;
+    } else {
+      html += `
+        <div class="section-header" style="margin-top: 16px;">
+          <h2 class="section-title">🎬 Tüm Video Klipler</h2>
+          <span class="section-see-all">${videos.length} video klip</span>
+        </div>
+        <div class="video-grid" style="margin-top: 16px;">
+          ${videos.map((v, i) => `
+            <div class="video-card" onclick='openVideoPlayerByIndexDirect(${i})'>
+              <div class="video-card-thumb-wrap">
+                <img class="video-card-thumb" src="${v.thumbnail}" alt="${escapeHtml(v.title)}" loading="lazy" onerror="this.src='${getDefaultArtwork()}'">
+                <div class="video-card-overlay">
+                  <div class="video-play-btn-circle">
+                    <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                  </div>
+                </div>
+                <span class="video-card-hd-badge">HD</span>
+                <span class="video-card-duration">${v.duration || '03:45'}</span>
+              </div>
+              <div class="video-card-info">
+                <h4 class="video-card-title">${escapeHtml(v.title)}</h4>
+                <span class="video-card-channel">${escapeHtml(v.channel)}</span>
+                <span class="video-card-meta">${v.views || 'YouTube'}</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+  }
+
+  rd.innerHTML = html;
+}
+
+function openVideoPlayerByIndexDirect(idx) {
+  const v = state.searchVideos && state.searchVideos[idx];
+  if (v) openVideoPlayer(v);
+}
+
+function renderSearchVideoCard(v) {
+  const vJson = JSON.stringify(v).replace(/"/g, '&quot;');
+  return `
+    <div class="search-video-card" onclick="openVideoPlayer(${vJson})">
+      <div class="search-video-thumb-wrap">
+        <img class="search-video-thumb" src="${v.thumbnail}" alt="${escapeHtml(v.title)}" loading="lazy" onerror="this.src='${getDefaultArtwork()}'">
+        <div class="search-video-overlay">
+          <div class="search-video-play-icon">
+            <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+          </div>
+        </div>
+        <span class="search-video-badge">🎬 KLİP</span>
+      </div>
+      <div class="search-video-info">
+        <h4 class="search-video-title">${escapeHtml(v.title)}</h4>
+        <span class="search-video-artist">${escapeHtml(v.channel)}</span>
+      </div>
+    </div>
+  `;
 }
 function populateSearchGenres() {
   const grid=document.getElementById('searchGenreGrid'); if(!grid) return;
@@ -394,7 +813,7 @@ function renderTrackCard(track,index,gridId) {
   const il=state.likedSongs.some(s=>s.id===track.id);
   const likeFill = il ? 'currentColor' : 'none';
   const trackIdStr = String(track.id).replace(/'/g, "\\'");
-  return `<div class="track-card ${ip?'playing':''}" onclick="playFromGrid('${gridId}',${index})" data-track-id="${track.id}"><div class="track-card-art"><img src="${track.artwork}" alt="${escapeHtml(track.name)}" loading="lazy" onerror="this.src='${getDefaultArtwork()}'"><button class="track-card-play" onclick="event.stopPropagation();playFromGrid('${gridId}',${index})">${ip?'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>':'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'}</button><button class="card-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')"><svg viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button><button class="card-shared-btn" onclick="event.stopPropagation();openAddToSharedMenu('${trackIdStr}')" title="Ortak listeye ekle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zM8 11c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg></button></div><div class="track-card-info"><div class="track-card-name">${escapeHtml(track.name)}</div><div class="track-card-artist">${escapeHtml(track.artist)}</div></div></div>`;
+  return `<div class="track-card ${ip?'playing':''}" onclick="playFromGrid('${gridId}',${index})" data-track-id="${track.id}"><div class="track-card-art"><img src="${track.artwork}" alt="${escapeHtml(track.name)}" loading="lazy" onerror="this.src='${getDefaultArtwork()}'"><button class="track-card-play" onclick="event.stopPropagation();playFromGrid('${gridId}',${index})">${ip?'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>':'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'}</button><button class="card-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')"><svg viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button></div><div class="track-card-info"><div class="track-card-name">${escapeHtml(track.name)}</div><div class="track-card-artist">${escapeHtml(track.artist)}</div></div></div>`;
 }
 function renderTrackListItem(track,index, context = 'playlist') {
   const ip=state.currentTrack&&state.currentTrack.id===track.id;
@@ -405,7 +824,7 @@ function renderTrackListItem(track,index, context = 'playlist') {
   const trackIdStr = String(track.id).replace(/'/g, "\\'");
   const artistEsc = escapeHtml(track.artist || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\r\n]/g, ' ');
   const nameEsc = escapeHtml(track.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\r\n]/g, ' ');
-  return `<div class="track-list-item ${ip?'playing':''}" onclick="playFromContext('${context}', ${index})" data-track-id="${track.id}"><div><span class="track-list-number">${index+1}</span><span class="track-list-play-icon">${isPlayingIcon}</span></div><div class="track-list-info"><div class="track-list-art"><img src="${track.artworkSmall||track.artwork}" alt="" loading="lazy" onerror="this.src='${getDefaultArtwork()}'></div><div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name)}</div><div class="track-list-artist">${escapeHtml(track.artist)}</div></div></div><div class="track-list-album">${escapeHtml(track.album||'')}</div><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><button class="track-yt-btn" onclick="event.stopPropagation();openYouTube(${artistEsc}, ${nameEsc})" title="YouTube'da Ara"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg></button><button class="track-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')" title="Beğen"><svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 3?"/></svg></button><button class="track-shared-btn" onclick="event.stopPropagation();openAddToSharedMenu('${trackIdStr}')" title="Ortak listeye ekle"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zM8 11c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg></button><span class="track-list-duration">${d}</span></div></div>`;
+  return `<div class="track-list-item ${ip?'playing':''}" onclick="playFromContext('${context}', ${index})" data-track-id="${track.id}"><div><span class="track-list-number">${index+1}</span><span class="track-list-play-icon">${isPlayingIcon}</span></div><div class="track-list-info"><div class="track-list-art"><img src="${track.artworkSmall||track.artwork}" alt="" loading="lazy" onerror="this.src='${getDefaultArtwork()}'></div><div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name)}</div><div class="track-list-artist">${escapeHtml(track.artist)}</div></div></div><div class="track-list-album">${escapeHtml(track.album||'')}</div><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><button class="track-video-btn" onclick="event.stopPropagation();openTrackVideo(${artistEsc}, ${nameEsc}, '${trackIdStr}')" title="Klibi İzle 🎬"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg><span>Klip</span></button><button class="track-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')" title="Beğen"><svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 3?"/></svg></button><span class="track-list-duration">${d}</span></div></div>`;
 }
 function playFromContext(context, idx) {
   if (context === 'search' || context === 'playlist') state.queue = [...state.currentPlaylistTracks];
@@ -413,330 +832,61 @@ function playFromContext(context, idx) {
   else if (context === 'mySongs') state.queue = [...state.mySongs];
   state.queueIndex = idx; playTrack(state.queue[idx]);
 }
+
+async function openTrackVideo(artist, name, trackId) {
+  const allTracks = [...(state.currentPlaylistTracks || []), ...(state.likedSongs || []), ...(state.mySongs || []), ...(state.recentlyPlayed || [])];
+  if (state.currentTrack) allTracks.push(state.currentTrack);
+  const track = allTracks.find(t => String(t.id) === String(trackId));
+
+  if (track && track.youtubeId) {
+    openVideoPlayer({
+      id: track.id,
+      youtubeId: track.youtubeId,
+      title: track.name,
+      channel: track.artist,
+      duration: 'HD',
+      thumbnail: track.artwork || track.artworkSmall,
+      views: 'YouTube'
+    });
+    return;
+  }
+
+  showToast(`"${name}" klibi aranıyor... 🎬`);
+  try {
+  const q = `${artist} ${name} official video clip`;
+  const results = await searchYouTube(q, 4);
+  if (results && results.length > 0) {
+      const candidates = results.map((item) => ({
+        id: item.id,
+        youtubeId: item.youtubeId,
+        title: item.name,
+        channel: item.artist,
+        duration: 'HD',
+        thumbnail: item.artwork || (track ? (track.artwork || track.artworkSmall) : getDefaultArtwork()),
+        views: 'YouTube'
+      }));
+      openVideoPlayer({ ...candidates[0], fallbackVideos: candidates.slice(1) });
+    } else {
+      showToast('Bu şarkı için video klip bulunamadı.');
+    }
+  } catch (err) {
+    console.warn('Video search error:', err);
+    showToast('Klip açılırken bir sorun oluştu.');
+  }
+}
 function toggleLikeById(id) {
   const allTracks = [...state.currentPlaylistTracks, ...state.likedSongs, ...state.mySongs, ...state.recentlyPlayed];
   if (state.currentTrack) allTracks.push(state.currentTrack);
   const track = allTracks.find(t => String(t.id) === String(id));
   if (track) toggleLikeTrack(track);
 }
-
-// ── Ortak Çalma Listeleri ──
-const SHARED_API = '/api/playlists';
-state.mySharedPlaylists = [];
-state.activeSharedPlaylist = null;
-
-function currentUserName() {
-  const account = getAccount();
-  return account?.name || 'Misafir';
-}
-
-async function sharedApiCall(action, { method = 'GET', body, query } = {}) {
-  const params = new URLSearchParams({ action, ...(query || {}) });
-  const url = method === 'GET' ? `${SHARED_API}?${params.toString()}` : `${SHARED_API}?action=${action}`;
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `İstek başarısız (${res.status})`);
-  return data;
-}
-
-function openSharedPlaylists() {
-  document.querySelectorAll('.nav-item, .mobile-nav-item').forEach(el=>el.classList.toggle('active', el.dataset.view === 'sharedPlaylists'));
-  document.getElementById('sharedPlaylistsModal').hidden = false;
-  document.getElementById('sharedListView').hidden = false;
-  document.getElementById('sharedDetailView').hidden = true;
-  document.getElementById('sharedListError').textContent = '';
-  refreshMySharedPlaylists();
-}
-function closeSharedPlaylists() {
-  document.getElementById('sharedPlaylistsModal').hidden = true;
-  document.querySelectorAll('.nav-item, .mobile-nav-item').forEach(el=>el.classList.toggle('active', el.dataset.view === state.currentView));
-}
-
-function showSharedError(message) {
-  const el = document.getElementById('sharedListError');
-  if (el) el.textContent = message;
-  showToast(message);
-}
-
-async function refreshMySharedPlaylists() {
-  const user = currentUserName();
-  const container = document.getElementById('mySharedPlaylists');
-  try {
-    const { playlists } = await sharedApiCall('list', { query: { userName: user } });
-    state.mySharedPlaylists = playlists || [];
-    renderMySharedPlaylists();
-  } catch (err) {
-    console.error('Shared playlists list error:', err);
-    container.innerHTML = '<p class="shared-empty-hint">Listeler yüklenemedi. Bağlantını kontrol et.</p>';
-  }
-}
-
-function renderMySharedPlaylists() {
-  const container = document.getElementById('mySharedPlaylists');
-  const badge = document.getElementById('sharedPlaylistsBadge');
-  if (!state.mySharedPlaylists.length) {
-    container.innerHTML = '<p class="shared-empty-hint">Henüz ortak listen yok. Yeni bir tane oluştur ya da arkadaşının kodunu gir.</p>';
-    badge.hidden = true;
-    return;
-  }
-  badge.hidden = false;
-  badge.textContent = String(state.mySharedPlaylists.length);
-  container.innerHTML = state.mySharedPlaylists.map((p) => `
-    <button class="shared-playlist-row" onclick="openSharedPlaylistDetail('${p.code}')">
-      <div class="shared-playlist-row-icon">🎶</div>
-      <div class="shared-playlist-row-info">
-        <div class="shared-playlist-row-name">${escapeHtml(p.name)}</div>
-        <div class="shared-playlist-row-meta">${p.members.length} üye · ${p.tracks.length} şarkı</div>
-      </div>
-      <div class="shared-playlist-row-code">${p.code}</div>
-    </button>
-  `).join('');
-}
-
-function promptCreateSharedPlaylist() {
-  const name = prompt('Ortak çalma listesine bir isim ver:', 'Bizim Liste');
-  if (name === null) return;
-  createSharedPlaylist(name.trim() || 'Bizim Liste');
-}
-
-async function createSharedPlaylist(name) {
-  const user = currentUserName();
-  try {
-    const { playlist } = await sharedApiCall('create', {
-      method: 'POST',
-      body: { name, ownerName: user, tracks: [] },
-    });
-    showToast(`"${playlist.name}" oluşturuldu. Kod: ${playlist.code}`);
-    await refreshMySharedPlaylists();
-    openSharedPlaylistDetail(playlist.code);
-  } catch (err) {
-    showSharedError(err.message || 'Liste oluşturulamadı.');
-  }
-}
-
-async function joinSharedPlaylistByCode() {
-  const input = document.getElementById('joinCodeInput');
-  const code = input.value.trim().toUpperCase();
-  if (!code) { showSharedError('Bir kod gir.'); return; }
-  const user = currentUserName();
-  try {
-    const { playlist } = await sharedApiCall('join', { method: 'POST', body: { code, userName: user } });
-    input.value = '';
-    showToast(`"${playlist.name}" listesine katıldın.`);
-    await refreshMySharedPlaylists();
-    openSharedPlaylistDetail(playlist.code);
-  } catch (err) {
-    showSharedError(err.message || 'Katılım başarısız. Kodu kontrol et.');
-  }
-}
-
-async function openSharedPlaylistDetail(code) {
-  try {
-    const { playlist } = await sharedApiCall('get', { query: { code } });
-    state.activeSharedPlaylist = playlist;
-    document.getElementById('sharedListView').hidden = true;
-    document.getElementById('sharedDetailView').hidden = false;
-    renderSharedPlaylistDetail();
-  } catch (err) {
-    showSharedError(err.message || 'Liste açılamadı.');
-  }
-}
-
-function closeSharedPlaylistDetail() {
-  state.activeSharedPlaylist = null;
-  document.getElementById('sharedListView').hidden = false;
-  document.getElementById('sharedDetailView').hidden = true;
-  refreshMySharedPlaylists();
-}
-
-function renderSharedPlaylistDetail() {
-  const p = state.activeSharedPlaylist;
-  if (!p) return;
-  const user = currentUserName();
-  document.getElementById('sharedDetailName').textContent = p.name;
-  document.getElementById('sharedDetailMembers').textContent = `${p.members.length} üye`;
-  document.getElementById('sharedDetailTrackCount').textContent = `${p.tracks.length} şarkı`;
-  document.getElementById('sharedDetailCode').textContent = p.code;
-
-  const tracksEl = document.getElementById('sharedDetailTracks');
-  if (!p.tracks.length) {
-    tracksEl.innerHTML = '<p class="shared-empty-hint">Bu listede henüz şarkı yok. Bir şarkının yanındaki "Ortak listeye ekle" butonunu kullan.</p>';
-    return;
-  }
-  const likes = p.likes || {};
-  tracksEl.innerHTML = p.tracks.map((track, i) => {
-    const likedByNames = Object.keys(likes).filter((name) => likes[name]);
-    const trackLikedByMe = false; // per-track beğeni sonraki adımda genişletilebilir
-    return `
-    <div class="shared-track-row" data-track-id="${track.id}">
-      <span class="shared-track-index">${i + 1}</span>
-      <img class="shared-track-art" src="${track.artworkSmall || track.artwork}" alt="" loading="lazy" onerror="this.src='${getDefaultArtwork()}'">
-      <div class="shared-track-info" onclick="playSharedTrack(${i})">
-        <div class="shared-track-name">${escapeHtml(track.name)}</div>
-        <div class="shared-track-artist">${escapeHtml(track.artist)}</div>
-      </div>
-      <button class="shared-track-remove" onclick="removeSharedTrack('${track.id}')" title="Listeden çıkar">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>`;
-  }).join('') + renderPlaylistLikesFooter(p, user);
-}
-
-function renderPlaylistLikesFooter(p, user) {
-  const likes = p.likes || {};
-  const likedNames = Object.keys(likes).filter((n) => likes[n]);
-  const iLiked = likedNames.includes(user);
-  return `
-    <div class="shared-playlist-footer">
-      <button class="shared-like-playlist-btn ${iLiked ? 'liked' : ''}" onclick="toggleSharedPlaylistLike()">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="${iLiked ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
-        ${iLiked ? 'Beğenildi' : 'Beğen'}
-      </button>
-      <span class="shared-like-names">${likedNames.length ? `Beğenenler: ${likedNames.map(escapeHtml).join(', ')}` : 'Henüz kimse beğenmedi'}</span>
-    </div>`;
-}
-
-async function toggleSharedPlaylistLike() {
-  const p = state.activeSharedPlaylist;
-  if (!p) return;
-  const user = currentUserName();
-  const alreadyLiked = Boolean((p.likes || {})[user]);
-  try {
-    const { playlist } = await sharedApiCall('like', {
-      method: 'POST',
-      body: { code: p.code, userName: user, liked: !alreadyLiked },
-    });
-    state.activeSharedPlaylist = playlist;
-    renderSharedPlaylistDetail();
-  } catch (err) {
-    showToast(err.message || 'Beğeni gönderilemedi.');
-  }
-}
-
-function playSharedTrack(index) {
-  const p = state.activeSharedPlaylist;
-  if (!p || !p.tracks[index]) return;
-  state.queue = p.tracks.map(sharedTrackToPlayable);
-  state.queueIndex = index;
-  playTrack(state.queue[index]);
-}
-
-function playSharedPlaylistAll() {
-  const p = state.activeSharedPlaylist;
-  if (!p || !p.tracks.length) return;
-  state.queue = p.tracks.map(sharedTrackToPlayable);
-  state.queueIndex = 0;
-  playTrack(state.queue[0]);
-}
-
-function sharedTrackToPlayable(t) {
-  return { ...t };
-}
-
-async function addTrackToSharedPlaylist(code, track) {
-  const user = currentUserName();
-  try {
-    const { playlist } = await sharedApiCall('addTrack', {
-      method: 'POST',
-      body: { code, userName: user, track: {
-        id: track.id, name: track.name, artist: track.artist, album: track.album,
-        artwork: track.artwork, artworkSmall: track.artworkSmall,
-        previewUrl: track.previewUrl, duration: track.duration, isFullSong: track.isFullSong,
-      } },
-    });
-    showToast(`"${track.name}" ${playlist.name} listesine eklendi.`);
-    if (state.activeSharedPlaylist && state.activeSharedPlaylist.code === code) {
-      state.activeSharedPlaylist = playlist;
-      renderSharedPlaylistDetail();
-    }
-  } catch (err) {
-    showToast(err.message || 'Şarkı eklenemedi.');
-  }
-}
-
-async function removeSharedTrack(trackId) {
-  const p = state.activeSharedPlaylist;
-  if (!p) return;
-  try {
-    const { playlist } = await sharedApiCall('removeTrack', {
-      method: 'POST',
-      body: { code: p.code, trackId },
-    });
-    state.activeSharedPlaylist = playlist;
-    renderSharedPlaylistDetail();
-  } catch (err) {
-    showToast(err.message || 'Şarkı kaldırılamadı.');
-  }
-}
-
-function copySharedCode() {
-  const p = state.activeSharedPlaylist;
-  if (!p) return;
-  navigator.clipboard?.writeText(p.code).then(() => showToast('Kod kopyalandı: ' + p.code))
-    .catch(() => showToast('Kod: ' + p.code));
-}
-
-function openAddToSharedMenu(trackJsonId) {
-  const allTracks = [...state.currentPlaylistTracks, ...state.likedSongs, ...state.mySongs, ...state.recentlyPlayed];
-  if (state.currentTrack) allTracks.push(state.currentTrack);
-  const track = allTracks.find(t => String(t.id) === String(trackJsonId));
-  if (!track) { showToast('Şarkı bulunamadı.'); return; }
-
-  if (!state.mySharedPlaylists.length) {
-    if (confirm('Henüz ortak listen yok. Yeni bir tane oluşturmak ister misin?')) {
-      const name = prompt('Ortak çalma listesine bir isim ver:', 'Bizim Liste');
-      if (name === null) return;
-      createSharedPlaylistThenAdd(name.trim() || 'Bizim Liste', track);
-    }
-    return;
-  }
-  const options = state.mySharedPlaylists.map((p, i) => `${i + 1}. ${p.name} (${p.code})`).join('\n');
-  const choice = prompt(`Hangi listeye eklensin?\n${options}\n\n(Numara yaz, ya da yeni liste için 0 yaz)`, '1');
-  if (choice === null) return;
-  const idx = parseInt(choice, 10);
-  if (idx === 0) {
-    const name = prompt('Ortak çalma listesine bir isim ver:', 'Bizim Liste');
-    if (name === null) return;
-    createSharedPlaylistThenAdd(name.trim() || 'Bizim Liste', track);
-    return;
-  }
-  const target = state.mySharedPlaylists[idx - 1];
-  if (!target) { showToast('Geçersiz seçim.'); return; }
-  addTrackToSharedPlaylist(target.code, track);
-}
-
-async function createSharedPlaylistThenAdd(name, track) {
-  const user = currentUserName();
-  try {
-    const { playlist } = await sharedApiCall('create', {
-      method: 'POST',
-      body: { name, ownerName: user, tracks: [] },
-    });
-    await refreshMySharedPlaylists();
-    await addTrackToSharedPlaylist(playlist.code, track);
-  } catch (err) {
-    showToast(err.message || 'Liste oluşturulamadı.');
-  }
-}
-
 function renderSkeletonCards(c) { return Array(c).fill('').map(()=>'<div class="skeleton-card"><div class="skeleton skeleton-art"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text-sm"></div></div>').join(''); }
 
 // ── Playback ──
 function updatePlayerUI() {
   const player = document.querySelector('.player');
   const t=state.currentTrack;
-  if (!t) {
-    player?.classList.add('player-hidden');
-    player?.style.removeProperty('display');
-    document.title = 'SpoFlix - Müzik Dinle';
-    if ('mediaSession' in navigator) {
-      navigator.mediaSession.metadata = null;
-      navigator.mediaSession.playbackState = 'none';
-    }
-    return;
-  }
+  if (!t) { player?.classList.add('player-hidden'); player?.style.removeProperty('display'); return; }
   player?.classList.remove('player-hidden');
   player?.style.removeProperty('display');
   document.getElementById('playerTrackName').textContent=t.name;
@@ -750,52 +900,43 @@ function updatePlayerUI() {
   const lb=document.getElementById('playerLikeBtn'); lb.classList.toggle('liked',il);
   lb.innerHTML=il?'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>';
   document.title=t.name+' - '+t.artist+' | Spoflix';
-  if('mediaSession'in navigator) {
-    navigator.mediaSession.metadata=new MediaMetadata({title:t.name,artist:t.artist,album:t.album||'',artwork:[{src:t.artworkSmall||t.artwork,sizes:'150x150',type:'image/jpeg'},{src:t.artwork,sizes:'480x480',type:'image/jpeg'}]});
-    navigator.mediaSession.playbackState = state.isPlaying ? 'playing' : 'paused';
-    navigator.mediaSession.setActionHandler('play',()=>togglePlayPause());
-    navigator.mediaSession.setActionHandler('pause',()=>togglePlayPause());
-    navigator.mediaSession.setActionHandler('previoustrack',()=>playPrev());
-    navigator.mediaSession.setActionHandler('nexttrack',()=>playNext());
-    navigator.mediaSession.setActionHandler('seekbackward',(details)=>{
-      const skip = details.seekOffset || 10;
-      if (state.playbackMode === 'youtube' && ytPlayer) ytPlayer.seekTo(Math.max(0, ytPlayer.getCurrentTime()-skip), true);
-      else audio.currentTime = Math.max(0, audio.currentTime - skip);
-    });
-    navigator.mediaSession.setActionHandler('seekforward',(details)=>{
-      const skip = details.seekOffset || 10;
-      if (state.playbackMode === 'youtube' && ytPlayer) ytPlayer.seekTo(ytPlayer.getCurrentTime()+skip, true);
-      else audio.currentTime = Math.min(audio.duration||Infinity, audio.currentTime + skip);
-    });
+  if('mediaSession' in navigator) {
     try {
-      navigator.mediaSession.setActionHandler('seekto',(details)=>{
-        if (details.seekTime == null) return;
-        if (state.playbackMode === 'youtube' && ytPlayer) ytPlayer.seekTo(details.seekTime, true);
-        else audio.currentTime = details.seekTime;
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: t.name,
+        artist: t.artist,
+        album: t.album || 'SpoFlix',
+        artwork: [
+          { src: t.artworkSmall || t.artwork || getDefaultArtwork(), sizes: '150x150', type: 'image/jpeg' },
+          { src: t.artwork || getDefaultArtwork(), sizes: '480x480', type: 'image/jpeg' },
+          { src: t.artwork || getDefaultArtwork(), sizes: '512x512', type: 'image/jpeg' }
+        ]
       });
-    } catch (e) { /* seekto not supported everywhere */ }
-    updateMediaSessionPosition();
-  }
-}
-
-function updateMediaSessionPosition() {
-  if (!('mediaSession' in navigator) || !('setPositionState' in navigator.mediaSession)) return;
-  try {
-    let duration = 0, position = 0;
-    if (state.playbackMode === 'youtube' && ytPlayerReady && ytPlayer) {
-      duration = ytPlayer.getDuration() || 0;
-      position = ytPlayer.getCurrentTime() || 0;
-    } else {
-      duration = audio.duration || 0;
-      position = audio.currentTime || 0;
+      navigator.mediaSession.playbackState = state.isPlaying ? 'playing' : 'paused';
+      navigator.mediaSession.setActionHandler('play', () => { if (!state.isPlaying) togglePlayPause(); });
+      navigator.mediaSession.setActionHandler('pause', () => { if (state.isPlaying) togglePlayPause(); });
+      navigator.mediaSession.setActionHandler('previoustrack', () => playPrev());
+      navigator.mediaSession.setActionHandler('nexttrack', () => playNext());
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        if (details.seekTime !== undefined) {
+          if (state.playbackMode === 'youtube' && ytPlayer?.seekTo) ytPlayer.seekTo(details.seekTime, true);
+          else audio.currentTime = details.seekTime;
+        }
+      });
+      navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+        const skip = details.seekOffset || 10;
+        if (state.playbackMode === 'youtube' && ytPlayer?.seekTo) ytPlayer.seekTo(Math.max(0, ytPlayer.getCurrentTime() - skip), true);
+        else audio.currentTime = Math.max(0, audio.currentTime - skip);
+      });
+      navigator.mediaSession.setActionHandler('seekforward', (details) => {
+        const skip = details.seekOffset || 10;
+        if (state.playbackMode === 'youtube' && ytPlayer?.seekTo) ytPlayer.seekTo(ytPlayer.getCurrentTime() + skip, true);
+        else audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + skip);
+      });
+    } catch (e) {
+      console.warn('mediaSession error:', e);
     }
-    if (!duration || !isFinite(duration)) return;
-    navigator.mediaSession.setPositionState({
-      duration,
-      playbackRate: state.nightcoreOn ? 1.15 : 1,
-      position: Math.min(position, duration),
-    });
-  } catch (e) { /* ignore transient state mismatches */ }
+  }
 }
 async function toggleLyrics() {
   const panel = document.getElementById('lyricsPanel');
@@ -958,25 +1099,7 @@ function playNext() {
   if(state.queue.length===0) return;
   if(state.repeatMode===2) { audio.currentTime=0; audio.play(); return; }
   if(state.isShuffle) state.queueIndex=Math.floor(Math.random()*state.queue.length);
-  else {
-    state.queueIndex++;
-    if(state.queueIndex>=state.queue.length) {
-      if(state.repeatMode===1) state.queueIndex=0;
-      else {
-        // Kuyruk bitti, tekrar modu kapalı: çalmayı durdur ve player bar'ı
-        // tamamen kaldır. Duraklamış halde takılı bırakmıyoruz.
-        audio.pause();
-        stopKeepAlive();
-        releaseWakeLock();
-        state.isPlaying=false;
-        state.currentTrack=null;
-        state.queueIndex=state.queue.length;
-        updatePlayerUI();
-        updatePlayingStates();
-        return;
-      }
-    }
-  }
+  else { state.queueIndex++; if(state.queueIndex>=state.queue.length) { if(state.repeatMode===1) state.queueIndex=0; else { state.queueIndex=state.queue.length-1; audio.pause(); state.isPlaying=false; updatePlayerUI(); return; } } }
   playTrack(state.queue[state.queueIndex]);
 }
 function playPrev() {
@@ -997,40 +1120,88 @@ function playFromGrid(gid,idx) { const gd=window['_gridData_'+gid]||[]; if(gd.le
 function playFromPlaylist(idx) { state.queue=[...state.currentPlaylistTracks]; state.queueIndex=idx; playTrack(state.queue[state.queueIndex]); }
 function openYouTube(artist,name) { window.open('https://www.youtube.com/results?search_query='+encodeURIComponent(artist+' '+name),'_blank','noopener'); }
 
-// ── Volume ──
-let isDraggingVolume=false;
-function startVolumeDrag(e) { isDraggingVolume=true; updateVolumeFromEvent(e); document.addEventListener('mousemove',handleVolumeDrag); document.addEventListener('mouseup',stopVolumeDrag); }
-function handleVolumeDrag(e) { if(isDraggingVolume) updateVolumeFromEvent(e); }
-function stopVolumeDrag() { isDraggingVolume=false; document.removeEventListener('mousemove',handleVolumeDrag); document.removeEventListener('mouseup',stopVolumeDrag); }
-
-let isDraggingBoost=false;
-function updateBoostFromEvent(e) {
-  const wrapper = document.getElementById('boostSliderWrapper');
-  const rect = wrapper.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-  const percent = Math.round(50 + ratio * 100);
-  setBoostGain(percent);
+function getEventClientX(e) {
+  if (e.touches && e.touches.length > 0) return e.touches[0].clientX;
+  if (e.changedTouches && e.changedTouches.length > 0) return e.changedTouches[0].clientX;
+  return e.clientX || 0;
 }
-function startBoostDrag(e) { isDraggingBoost=true; updateBoostFromEvent(e); document.addEventListener('mousemove',handleBoostDrag); document.addEventListener('mouseup',stopBoostDrag); }
-function handleBoostDrag(e) { if(isDraggingBoost) updateBoostFromEvent(e); }
-function stopBoostDrag() { isDraggingBoost=false; document.removeEventListener('mousemove',handleBoostDrag); document.removeEventListener('mouseup',stopBoostDrag); }
-function updateVolumeIcon() { document.getElementById('iconVolumeHigh').style.display=state.isMuted?'none':'block'; document.getElementById('iconVolumeMuted').style.display=state.isMuted?'block':'none'; }
+
+// ── Volume ──
+let isDraggingVolume = false;
+function startVolumeDrag(e) {
+  isDraggingVolume = true;
+  updateVolumeFromEvent(e);
+  window.addEventListener('mousemove', handleVolumeDrag);
+  window.addEventListener('mouseup', stopVolumeDrag);
+  window.addEventListener('touchmove', handleVolumeDrag, { passive: false });
+  window.addEventListener('touchend', stopVolumeDrag);
+}
+function handleVolumeDrag(e) {
+  if (isDraggingVolume) {
+    if (e.cancelable) e.preventDefault();
+    updateVolumeFromEvent(e);
+  }
+}
+function stopVolumeDrag() {
+  isDraggingVolume = false;
+  window.removeEventListener('mousemove', handleVolumeDrag);
+  window.removeEventListener('mouseup', stopVolumeDrag);
+  window.removeEventListener('touchmove', handleVolumeDrag);
+  window.removeEventListener('touchend', stopVolumeDrag);
+}
+function updateVolumeIcon() {
+  document.getElementById('iconVolumeHigh').style.display = state.isMuted ? 'none' : 'block';
+  document.getElementById('iconVolumeMuted').style.display = state.isMuted ? 'block' : 'none';
+}
 
 // ── Progress Bar ──
 function startSeek(e) {
-  state.isSeeking=true; const duration=audio.duration||0;
-  const onMove=(e)=>{ if(!state.isSeeking) return; const bar=document.getElementById('progressBar'),rect=bar.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width)); document.getElementById('progressFill').style.width=`${ratio*100}%`; document.getElementById('currentTime').textContent=formatTime(ratio*duration); };
-  const onUp=(e)=>{ state.isSeeking=false; seekTo(e); document.removeEventListener('mousemove',onMove); document.removeEventListener('mouseup',onUp); };
-  document.addEventListener('mousemove',onMove); document.addEventListener('mouseup',onUp);
+  state.isSeeking = true;
+  const duration = audio.duration || 0;
+  const onMove = (evt) => {
+    if (!state.isSeeking) return;
+    if (evt.cancelable) evt.preventDefault();
+    const bar = document.getElementById('progressBar');
+    if (!bar) return;
+    const rect = bar.getBoundingClientRect();
+    const cx = getEventClientX(evt);
+    const ratio = Math.max(0, Math.min(1, (cx - rect.left) / rect.width));
+    document.getElementById('progressFill').style.width = `${ratio * 100}%`;
+    document.getElementById('currentTime').textContent = formatTime(ratio * duration);
+  };
+  const onUp = (evt) => {
+    state.isSeeking = false;
+    seekTo(evt);
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+    window.removeEventListener('touchmove', onMove);
+    window.removeEventListener('touchend', onUp);
+  };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+  window.addEventListener('touchmove', onMove, { passive: false });
+  window.addEventListener('touchend', onUp);
 }
-audio.addEventListener('canplay',()=>{ state.audioReady=true; });
-audio.addEventListener('ended',()=>{ if(Date.now()-state.trackStartTime>1000){ state.errorCount=0; playNext(); } else { state.errorCount++; if(state.errorCount<state.maxErrors) setTimeout(()=>playNext(),1000); else { showToast('Bazı şarkılar yüklenemiyor.'); state.isPlaying=false; updatePlayerUI(); state.errorCount=0; } } });
+
+audio.addEventListener('canplay', () => { state.audioReady = true; });
+
+// Mobilde arka planda kesintisiz geçiş: setTimeout olmadan anında sonraki şarkıya geç
+audio.addEventListener('ended', () => {
+  if (state.repeatMode === 2) {
+    audio.currentTime = 0;
+    audio.play().catch(() => {});
+    return;
+  }
+  state.errorCount = 0;
+  playNext();
+});
+
 audio.addEventListener('error', (e) => {
-  console.error('Audio error:', e);
+  console.warn('Audio error:', e);
   state.errorCount++;
   if (state.errorCount < state.maxErrors) {
     showToast('Şarkı yüklenemedi, sonraki deneniyor...');
-    setTimeout(() => playNext(), 1500);
+    setTimeout(() => playNext(), 1000);
   } else {
     showToast('Çok fazla hata oluştu.');
     state.isPlaying = false;
@@ -1187,23 +1358,38 @@ function syncSettingsUI() {
   const volume = document.getElementById('settingsVolume');
   const value = document.getElementById('settingsVolumeValue');
   const muteButton = document.getElementById('settingsMuteButton');
-  if (volume) volume.value = String(Math.round(state.volume * 100));
-  if (value) value.textContent = `${Math.round(state.volume * 100)}%`;
+  const basePct = Math.round(state.volume * 100);
+  const totalPct = state.isBoosted ? Math.round(basePct * state.boostMultiplier) : basePct;
+
+  if (volume) volume.value = String(totalPct);
+  if (value) {
+    if (state.isMuted) value.textContent = 'Sessiz';
+    else if (state.isBoosted || totalPct > 100) value.textContent = `${totalPct}% (Boost 🔥)`;
+    else value.textContent = `${totalPct}%`;
+  }
   if (muteButton) {
     muteButton.textContent = state.isMuted ? 'Açık' : 'Kapalı';
     muteButton.setAttribute('aria-pressed', String(state.isMuted));
   }
+  updateAudioModeUI();
 }
+
 function setSettingsVolume(value) {
-  state.volume = Math.max(0, Math.min(1, Number(value) / 100));
+  const num = Number(value);
+  initAudioEngine();
   state.isMuted = false;
-  audio.volume = state.volume;
-  if (ytPlayerReady && ytPlayer) ytPlayer.setVolume(state.volume * 100);
-  const fill = document.getElementById('volumeFill');
-  if (fill) fill.style.width = `${state.volume * 100}%`;
-  updateVolumeIcon();
-  syncSettingsUI();
+  if (num > 100) {
+    state.volume = 1.0;
+    state.isBoosted = true;
+    state.boostMultiplier = num / 100;
+  } else {
+    state.volume = Math.max(0, num / 100);
+    state.isBoosted = false;
+    state.boostMultiplier = 1.8;
+  }
+  applyVolumeSettings();
 }
+
 function toggleSettingsMute() {
   toggleMute();
   syncSettingsUI();
@@ -1219,25 +1405,227 @@ function resetSettings() {
   syncSettingsUI();
   showToast('Ayarlar sıfırlandı.');
 }
+
+// ── Ortak Klasör & Yükleme İşlemleri ──
+function toggleSingleUploadForm() {
+  const container = document.getElementById('singleUploadContainer');
+  const icon = document.getElementById('uploadToggleIcon');
+  if (!container) return;
+  const isHidden = container.style.display === 'none' || !container.style.display;
+  container.style.display = isHidden ? 'block' : 'none';
+  if (icon) icon.textContent = isHidden ? '▲' : '▼';
+}
+
+function triggerFolderSelect() {
+  const input = document.getElementById('folderAudioInput');
+  if (input) input.click();
+}
+
+async function handleFolderSelect(input) {
+  const files = Array.from(input.files || []);
+  if (files.length === 0) return;
+
+  const audioFiles = files.filter(f => {
+    const ext = f.name.slice(((f.name.lastIndexOf('.') - 1) >>> 0) + 2).toLowerCase();
+    return ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'webm'].includes(ext) || (f.type && f.type.startsWith('audio/'));
+  });
+
+  if (audioFiles.length === 0) {
+    showToast('Seçilen klasörde ses (MP3/WAV vb.) dosyası bulunamadı.');
+    input.value = '';
+    return;
+  }
+
+  const progress = document.getElementById('folderUploadProgress');
+  const progressText = document.getElementById('folderProgressText');
+  const progressCount = document.getElementById('folderProgressCount');
+  const progressFill = document.getElementById('folderProgressFill');
+
+  if (progress) progress.style.display = 'block';
+  showToast(`${audioFiles.length} şarkı taranıyor ve aktarılıyor...`);
+
+  let addedCount = 0;
+  for (let i = 0; i < audioFiles.length; i++) {
+    const file = audioFiles[i];
+    try {
+      let baseName = file.name.replace(/\.[^/.]+$/, "").trim();
+      baseName = baseName.replace(/^\d+[\s.-]+/, '').trim();
+
+      let artist = 'Ortak Sanatçı';
+      let title = baseName;
+
+      if (baseName.includes(' - ')) {
+        const parts = baseName.split(' - ');
+        artist = parts[0].trim();
+        title = parts.slice(1).join(' - ').trim();
+      } else if (baseName.includes(' – ')) {
+        const parts = baseName.split(' – ');
+        artist = parts[0].trim();
+        title = parts.slice(1).join(' – ').trim();
+      }
+
+      const audioBlob = await fileToBlob(file);
+      const duration = await getAudioDuration(file);
+      const art = getDefaultArtwork();
+
+      await saveSongToDB({
+        name: title || file.name,
+        artist: artist || 'Ortak Sanatçı',
+        album: 'Ortak Klasör',
+        artwork: art,
+        artworkSmall: art,
+        audioBlob: audioBlob,
+        duration: duration || 0
+      });
+      addedCount++;
+    } catch (err) {
+      console.warn(`Dosya kaydedilemedi (${file.name}):`, err);
+    }
+
+    const pct = Math.round(((i + 1) / audioFiles.length) * 100);
+    if (progressFill) progressFill.style.width = `${pct}%`;
+    if (progressCount) progressCount.textContent = `${pct}%`;
+    if (progressText) progressText.textContent = `${i + 1} / ${audioFiles.length} şarkı aktarıldı...`;
+  }
+
+  if (progress) progress.style.display = 'none';
+  input.value = '';
+  showToast(`${addedCount} şarkı Ortak Klasör'e eklendi! 🎉`);
+  await loadMySongsFromDB();
+  renderMySongs();
+}
+
+function playAllCustomSongs() {
+  if (state.mySongs.length > 0) {
+    state.queue = [...state.mySongs];
+    state.queueIndex = 0;
+    playTrack(state.queue[0]);
+  } else {
+    showToast('Ortak klasörde henüz şarkı yok.');
+  }
+}
+
+async function exportSharedFolder() {
+  try {
+    const songs = await getSongsFromDB();
+    if (!songs || songs.length === 0) {
+      showToast('Dışa aktarılacak şarkı bulunamadı.');
+      return;
+    }
+    showToast('Ortak klasör paketi hazırlanıyor...');
+    const exportData = [];
+    for (const s of songs) {
+      const b64 = await new Promise((res) => {
+        const reader = new FileReader();
+        reader.onloadend = () => res(reader.result);
+        reader.readAsDataURL(s.audioBlob);
+      });
+      exportData.push({
+        name: s.name,
+        artist: s.artist,
+        album: s.album || 'Ortak Klasör',
+        artwork: s.artwork,
+        artworkSmall: s.artworkSmall,
+        duration: s.duration,
+        audioData: b64
+      });
+    }
+    const jsonStr = JSON.stringify({ app: 'SpoFlix', version: 1, exportDate: new Date().toISOString(), songs: exportData });
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `spoflix_ortak_klasor_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast('Ortak Klasör paketi indirildi 📥');
+  } catch (err) {
+    console.error('Export error:', err);
+    showToast('Dışa aktarma sırasında hata oluştu.');
+  }
+}
+
+function triggerImportSharedFolder() {
+  const input = document.getElementById('importSharedInput');
+  if (input) input.click();
+}
+
+async function handleImportSharedFolder(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  showToast('Ortak klasör paketi okunuyor...');
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const songs = Array.isArray(parsed) ? parsed : (parsed.songs || []);
+    if (songs.length === 0) {
+      showToast('Paket içinde şarkı bulunamadı.');
+      input.value = '';
+      return;
+    }
+    let importedCount = 0;
+    for (const s of songs) {
+      let audioBlob = null;
+      if (s.audioData) {
+        const res = await fetch(s.audioData);
+        audioBlob = await res.blob();
+      } else if (s.audioBlob) {
+        audioBlob = s.audioBlob;
+      }
+      if (audioBlob) {
+        await saveSongToDB({
+          name: s.name,
+          artist: s.artist,
+          album: s.album || 'Ortak Klasör',
+          artwork: s.artwork || getDefaultArtwork(),
+          artworkSmall: s.artworkSmall || getDefaultArtwork(),
+          audioBlob: audioBlob,
+          duration: s.duration || 0
+        });
+        importedCount++;
+      }
+    }
+    input.value = '';
+    showToast(`${importedCount} şarkı Ortak Klasör'e içe aktarıldı! 🎉`);
+    await loadMySongsFromDB();
+    renderMySongs();
+  } catch (err) {
+    console.error('Import error:', err);
+    showToast('Paket içe aktarılırken hata oluştu.');
+    input.value = '';
+  }
+}
+
 function handleFileSelect(input,labelId) { document.getElementById(labelId).textContent=input.files&&input.files[0]?input.files[0].name:'Seçilmedi'; }
-function getAudioDuration(file) { return new Promise((resolve)=>{const u=URL.createObjectURL(file),ta=new Audio(u);ta.addEventListener('loadedmetadata',()=>{resolve(Math.round(ta.duration));URL.revokeObjectURL(u);});}); }
+function getAudioDuration(file) { return new Promise((resolve)=>{const u=URL.createObjectURL(file),ta=new Audio(u);ta.addEventListener('loadedmetadata',()=>{resolve(Math.round(ta.duration));URL.revokeObjectURL(u);});ta.addEventListener('error',()=>{resolve(0);URL.revokeObjectURL(u);});}); }
 function fileToBlob(file) { return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=e=>resolve(new Blob([e.target.result],{type:file.type}));r.onerror=e=>reject(e);r.readAsArrayBuffer(file);}); }
+
 async function handleSongUpload(e) {
   e.preventDefault(); const title=document.getElementById('songTitle').value.trim(),artist=document.getElementById('songArtist').value.trim(),af=document.getElementById('songAudioFile').files[0],cf=document.getElementById('songCoverFile').files[0];
   if(!af){showToast('Lütfen bir ses dosyası seçin!');return;} showToast('Şarkı işleniyor...');
   try {
     const ab=await fileToBlob(af); let art=getDefaultArtwork();
     if(cf){ const cb=await fileToBlob(cf); art=await new Promise((resolve)=>{const r=new FileReader();r.onloadend=()=>resolve(r.result);r.readAsDataURL(cb);}); }
-    const dur=await getAudioDuration(af); await saveSongToDB({name:title,artist:artist,album:'Yerel Yükleme',artwork:art,artworkSmall:art,audioBlob:ab,duration:dur});
+    const dur=await getAudioDuration(af); await saveSongToDB({name:title,artist:artist,album:'Ortak Klasör',artwork:art,artworkSmall:art,audioBlob:ab,duration:dur});
     showToast('Şarkı eklendi! 🎉'); document.getElementById('uploadForm').reset(); document.getElementById('audioFileName').textContent='Seçilmedi'; document.getElementById('coverFileName').textContent='Seçilmedi';
     await loadMySongsFromDB(); renderMySongs();
   } catch(err){console.error('Upload error:',err);showToast('Şarkı yüklenirken hata oluştu.');}
 }
-async function loadMySongsFromDB() { try { const songs=await getSongsFromDB(); state.mySongs=songs.map(s=>{const u=URL.createObjectURL(s.audioBlob);return{id:'local_'+s.id,dbId:s.id,name:s.name,artist:s.artist,album:s.album,artwork:s.artwork,artworkSmall:s.artworkSmall,previewUrl:u,duration:s.duration};}); } catch(err){console.error('Load custom songs error:',err);} }
+async function loadMySongsFromDB() { try { const songs=await getSongsFromDB(); state.mySongs=songs.map(s=>{const u=URL.createObjectURL(s.audioBlob);return{id:'local_'+s.id,dbId:s.id,name:s.name,artist:s.artist,album:s.album||'Ortak Klasör',artwork:s.artwork,artworkSmall:s.artworkSmall,previewUrl:u,duration:s.duration};}); } catch(err){console.error('Load custom songs error:',err);} }
 
 function renderMySongs() {
-  const c=document.getElementById('mySongsList'); const ce=document.getElementById('mySongsCount'); ce.textContent=state.mySongs.length+' şarkı';
-  if(state.mySongs.length===0){ c.innerHTML='<div class="empty-state" style="padding:40px 0;"><div class="empty-state-icon">📤</div><h3 class="empty-state-title">Henüz şarkı yüklemedin</h3><p class="empty-state-text">Yukarıdaki formu kullanarak ilk MP3 şarkını yükle!</p></div>'; return; }
+  const c=document.getElementById('mySongsList'); 
+  const ce=document.getElementById('mySongsCount'); 
+  const playAllBtn = document.getElementById('playAllCustomBtn');
+  if (ce) ce.textContent=state.mySongs.length+' şarkı';
+  if (playAllBtn) playAllBtn.style.display = state.mySongs.length > 0 ? 'inline-flex' : 'none';
+  if(!c) return;
+  if(state.mySongs.length===0){ 
+    c.innerHTML='<div class="empty-state" style="padding:40px 0;"><div class="empty-state-icon">📂</div><h3 class="empty-state-title">Ortak klasörde henüz şarkı yok</h3><p class="empty-state-text">Yukarıdaki "Ortak Klasör Seç" butonuna basarak bilgisayarından veya telefonundan bir müzik klasörü ekle!</p></div>'; 
+    return; 
+  }
   const html=state.mySongs.map((track,i)=>{
     const ip=state.currentTrack&&state.currentTrack.id===track.id;
     const il=state.likedSongs.some(s=>s.id===track.id);
@@ -1245,7 +1633,7 @@ function renderMySongs() {
     const isPlayingIcon=ip&&state.isPlaying?'<div class="equalizer"><div class="equalizer-bar"></div><div class="equalizer-bar"></div><div class="equalizer-bar"></div><div class="equalizer-bar"></div></div>':'<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
     const likeFill=il?'currentColor':'none';
     const trackIdStr = String(track.id).replace(/'/g, "\\'");
-    return `<div class="track-list-item ${ip?'playing':''}" onclick="playFromContext('mySongs', ${i})" data-track-id="${track.id}"><div><span class="track-list-number">${i+1}</span><span class="track-list-play-icon">${isPlayingIcon}</span></div><div class="track-list-info"><div class="track-list-art"><img src="${track.artwork}" alt="" loading="lazy"></div><div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name)}</div><div class="track-list-artist">${escapeHtml(track.artist)}</div></div></div><div class="track-list-album">${escapeHtml(track.album||'')}</div><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><button class="track-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')" title="Beğen"><svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button><button class="track-shared-btn" onclick="event.stopPropagation();openAddToSharedMenu('${trackIdStr}')" title="Ortak listeye ekle"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zM8 11c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg></button><button class="track-delete-btn" onclick="event.stopPropagation();removeCustomSong(${track.dbId})" title="Sil"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button><span class="track-list-duration">${d}</span></div></div>`;
+    return `<div class="track-list-item ${ip?'playing':''}" onclick="playFromContext('mySongs', ${i})" data-track-id="${track.id}"><div><span class="track-list-number">${i+1}</span><span class="track-list-play-icon">${isPlayingIcon}</span></div><div class="track-list-info"><div class="track-list-art"><img src="${track.artwork}" alt="" loading="lazy"></div><div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name)}</div><div class="track-list-artist">${escapeHtml(track.artist)}</div></div></div><div class="track-list-album">${escapeHtml(track.album||'')}</div><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><button class="track-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')" title="Beğen"><svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button><button class="track-delete-btn" onclick="event.stopPropagation();removeCustomSong(${track.dbId})" title="Sil"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button><span class="track-list-duration">${d}</span></div></div>`;
   }).join('');
   c.innerHTML='<div class="track-list"><div class="track-list-header"><span>#</span><span>Başlık</span><span>Albüm</span><span>Süre</span></div>'+html+'</div>';
 }
@@ -1259,19 +1647,28 @@ async function removeCustomSong(dbId) {
 async function initApp() {
   createHeroParticles();
   initTheme();
-  audio.playbackRate = state.nightcoreOn ? 1.15 : 1;
   updateAudioModeUI();
   try { state.lyricOffsets = JSON.parse(localStorage.getItem('spoflix_lyric_offsets') || '{}'); } catch (error) { state.lyricOffsets = {}; }
   updateAccountUI();
   await getAudiusHost();
   try { await initDatabase(); await loadMySongsFromDB(); } catch(e) { console.error('DB init failed:',e); }
   document.getElementById('trendingGrid').innerHTML=renderSkeletonCards(8);
+  document.getElementById('turkeyTrendGrid').innerHTML=renderSkeletonCards(8);
   document.getElementById('newReleasesGrid').innerHTML=renderSkeletonCards(8);
   document.getElementById('recommendedGrid').innerHTML=renderSkeletonCards(8);
+  const turkeyLoad = getTurkishTrendingTracks(20).then((turkey) => {
+    window._gridData_turkeyTrendGrid = turkey;
+    const grid = document.getElementById('turkeyTrendGrid');
+    if (turkey.length) grid.innerHTML = turkey.map((track, index) => renderTrackCard(track, index, 'turkeyTrendGrid')).join('');
+    else grid.innerHTML = '<p style="color:var(--text-secondary);padding:20px;">Türkiye listesi şu anda yüklenemedi.</p>';
+  }).catch((e) => console.error('Türkiye trendleri yüklenemedi:', e));
   try { const t=await getTrendingTracks('week',20); window._gridData_trendingGrid=t; const tg=document.getElementById('trendingGrid'); if(t.length>0) tg.innerHTML=t.map((t,i)=>renderTrackCard(t,i,'trendingGrid')).join(''); else tg.innerHTML='<p style="color:var(--text-secondary);padding:20px;">Yükleniyor...</p>'; } catch(e){console.error('Trending error:',e);}
   try { const nr=await getTrendingTracks('month',20); window._gridData_newReleasesGrid=nr; const ng=document.getElementById('newReleasesGrid'); if(nr.length>0) ng.innerHTML=nr.map((t,i)=>renderTrackCard(t,i,'newReleasesGrid')).join(''); } catch(e){console.error('New releases error:',e);}
   try { const rec=await getTrendingTracks('year',20); window._gridData_recommendedGrid=rec; const rg=document.getElementById('recommendedGrid'); if(rec.length>0) rg.innerHTML=rec.map((t,i)=>renderTrackCard(t,i,'recommendedGrid')).join(''); } catch(e){console.error('Recommended error:',e);}
   updateLikedCountDisplay();
+  initVideoModule();
+  applyVolumeSettings();
+  await turkeyLoad;
 }
 document.addEventListener('keydown',(e)=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
@@ -1279,13 +1676,34 @@ document.addEventListener('keydown',(e)=>{
     case 'Space': e.preventDefault(); togglePlayPause(); break;
     case 'ArrowRight': if(e.shiftKey) playNext(); else audio.currentTime=Math.min(audio.currentTime+5,audio.duration); break;
     case 'ArrowLeft': if(e.shiftKey) playPrev(); else audio.currentTime=Math.max(audio.currentTime-5,0); break;
-    case 'ArrowUp': e.preventDefault(); state.volume=Math.min(1,state.volume+0.05); audio.volume=state.volume; document.getElementById('volumeFill').style.width=`${state.volume*100}%`; break;
-    case 'ArrowDown': e.preventDefault(); state.volume=Math.max(0,state.volume-0.05); audio.volume=state.volume; document.getElementById('volumeFill').style.width=`${state.volume*100}%`; break;
+    case 'ArrowUp': e.preventDefault(); initAudioEngine(); state.volume=Math.min(1.0, state.volume+0.05); state.isMuted=false; applyVolumeSettings(); break;
+    case 'ArrowDown': e.preventDefault(); initAudioEngine(); state.volume=Math.max(0, state.volume-0.05); state.isMuted=false; applyVolumeSettings(); break;
+    case 'KeyB': e.preventDefault(); toggleBoost(); break;
     case 'KeyM': toggleMute(); break;
     case 'KeyS': if(e.ctrlKey){ e.preventDefault(); navigateTo('search'); } break;
   }
 });
 document.addEventListener('DOMContentLoaded', initApp);
+
+// İlk kullanıcı etkileşiminde Web Audio API AudioContext'ini anında uyandır
+const unlockAudioOnGesture = () => {
+  initAudioEngine();
+  if (audioContext && audioContext.state === 'suspended') {
+    audioContext.resume().catch(() => {});
+  }
+};
+document.addEventListener('click', unlockAudioOnGesture, { once: true, passive: true });
+document.addEventListener('keydown', unlockAudioOnGesture, { once: true, passive: true });
+document.addEventListener('touchstart', unlockAudioOnGesture, { once: true, passive: true });
+
+// Menü dışına tıklandığında ses modları dropdown'ını kapat
+document.addEventListener('click', (e) => {
+  const headerMenu = document.getElementById('headerAudioModesMenu');
+  const headerBtn = document.getElementById('headerAudioModesBtn');
+  if (headerMenu && !headerMenu.hidden && !headerMenu.contains(e.target) && !headerBtn?.contains(e.target)) {
+    headerMenu.hidden = true;
+  }
+});
 // ── 1. YOUTUBE FALLBACK PLAYER SİSTEMİ ──
 let ytPlayer = null;
 let ytPlayerReady = false;
@@ -1340,8 +1758,9 @@ function onYtPlayerStateChange(event) {
   if (event.data === YT.PlayerState.PLAYING) {
     state.audioReady = true;
     state.isPlaying = true;
-    if (ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(state.nightcoreOn ? 1.25 : 1);
+    if (ytPlayer.setPlaybackRate) ytPlayer.setPlaybackRate(state.audioMode === 'nightcore' ? 1.25 : 1);
     document.getElementById('totalTime').textContent = formatTime(ytPlayer.getDuration());
+    applyVolumeSettings();
     
     clearInterval(ytTimeInterval);
     ytTimeInterval = setInterval(() => {
@@ -1371,6 +1790,31 @@ function playTrack(track) {
     return;
   }
 
+  if (['apple-tr', 'apple-tr-fallback', 'turkish-featured'].includes(track.source)) {
+    const lookupToken = ++state.playToken;
+    showToast(`YouTube'da "${track.name}" aranıyor...`);
+    (async () => {
+      const query = `${track.name} ${track.artist}`;
+      const matches = await searchYouTube(query, 10);
+      if (lookupToken !== state.playToken) return;
+      const target = String(track.name).toLocaleLowerCase('tr-TR').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+      const playable = matches.find((item) => {
+        const name = String(item.name).toLocaleLowerCase('tr-TR').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+        return name.includes(target) || target.includes(name);
+      }) || matches[0];
+      if (playable?.youtubeId) {
+        playTrack({ ...track, previewUrl: '', youtubeId: playable.youtubeId, source: 'youtube' });
+      } else if (ytPlayerReady && ytPlayer) {
+        // Search results may be unavailable without a configured Data API key.
+        // Let the YouTube player search directly; never fall back to Apple audio.
+        playTrack({ ...track, previewUrl: '', youtubeQuery: query, source: 'youtube-search' });
+      } else {
+        showToast('YouTube sonucu bulunamadı. Biraz sonra tekrar dene.');
+      }
+    })();
+    return;
+  }
+
   // Her çağrıya benzersiz bir "token" ver. audio.play() gibi asenkron
   // işlemler tamamlandığında token hala en güncel mi diye kontrol edilecek.
   // Böylece araya başka bir şarkı seçimi girdiyse (kullanıcı hızlı tıkladıysa),
@@ -1388,35 +1832,34 @@ function playTrack(track) {
     loadLyricsForTrack(track);
   }
   
-  audio.pause();
-  audio.removeAttribute('src');
-  audio.load();
-  audio.currentTime = 0;
-  if(ytPlayerReady && ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
-  clearInterval(ytTimeInterval);
-
+  if (ytPlayerReady && ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
   const shouldPlay = true;
-  state.isPlaying = false; // Yeni şarkı yüklenirken duraklat
+  initAudioEngine();
+  applyAudioModeSettings();
+  applyVolumeSettings();
   
   if (track.previewUrl) {
     state.playbackMode = 'audio';
-    audio.src = track.previewUrl;
-    audio.load();
-    audio.playbackRate = state.nightcoreOn ? 1.15 : 1;
+    let audioSrc = track.previewUrl;
+    if ((audioSrc.startsWith('http://') || audioSrc.startsWith('https://')) && !audioSrc.includes('/api/stream')) {
+      audioSrc = '/api/stream?url=' + encodeURIComponent(track.previewUrl);
+    }
+    audio.src = audioSrc;
+    audio.currentTime = 0;
     if (shouldPlay) {
       audio.play().then(() => {
         if (myToken !== state.playToken) return;
         state.isPlaying = true;
         startAudioMotion();
-        requestWakeLock();
         updatePlayerUI();
         updatePlayingStates();
       }).catch(e => {
         if (myToken !== state.playToken) return;
-        console.error('audio.play() failed:', e);
+        console.warn('audio.play() failed:', e);
         state.isPlaying = false;
         updatePlayerUI();
       });
+      state.isPlaying = true;
     }
   } else if (ytPlayerReady && ytPlayer) {
     state.playbackMode = 'youtube';
@@ -1424,14 +1867,13 @@ function playTrack(track) {
     document.getElementById("currentTime").textContent = "0:00";
     document.getElementById("progressFill").style.width = "0%";
     
-        if (track.youtubeId) ytPlayer.loadVideoById(track.youtubeId);
-        else ytPlayer.loadPlaylist({ listType: 'search', list: track.artist + ' ' + track.name, index: 0 });
-        ytPlayer.unMute();
-        ytPlayer.setVolume(state.isMuted ? 0 : state.volume * 100);
-    if (shouldPlay) ytPlayer.playVideo();
-    if (!state.youtubeBgWarningShown) {
-      state.youtubeBgWarningShown = true;
-      showToast('Not: YouTube kaynaklı şarkılar arka planda durabilir (YouTube kısıtlaması).');
+    if (track.youtubeId) ytPlayer.loadVideoById(track.youtubeId);
+    else ytPlayer.loadPlaylist({ listType: 'search', list: track.youtubeQuery || (track.artist + ' ' + track.name), index: 0 });
+    ytPlayer.unMute();
+    ytPlayer.setVolume(state.isMuted ? 0 : Math.min(100, state.volume * 100));
+    if (shouldPlay) {
+      ytPlayer.playVideo();
+      state.isPlaying = true;
     }
   } else {
     state.playbackMode = 'audio';
@@ -1440,16 +1882,15 @@ function playTrack(track) {
     updatePlayerUI();
     setTimeout(() => { if (myToken === state.playToken) playNext(); }, 1000);
   }
-    state.isPlaying = state.playbackMode === 'youtube' ? shouldPlay : false;
-    updatePlayerUI(); 
-    addToRecentlyPlayed(track); 
-    updatePlayingStates();
+  updatePlayerUI(); 
+  addToRecentlyPlayed(track); 
+  updatePlayingStates();
 }
 
 function togglePlayPause() {
   if(!state.currentTrack) { 
-      if(state.queue.length > 0) playTrack(state.queue[0]); 
-      return; 
+    if(state.queue.length > 0) playTrack(state.queue[0]); 
+    return; 
   }
   
   if(state.isPlaying) { 
@@ -1457,14 +1898,12 @@ function togglePlayPause() {
     else audio.pause(); 
     state.isPlaying = false; 
     document.documentElement.style.setProperty('--audio-level', '0.08');
-    releaseWakeLock();
-    stopKeepAlive();
   } else { 
+    initAudioEngine();
     if(state.playbackMode === 'youtube' && ytPlayer) ytPlayer.playVideo();
-    else audio.play().catch(e => console.error(e)); 
+    else audio.play().catch(e => console.warn('Play error:', e)); 
     state.isPlaying = true; 
     startAudioMotion();
-    requestWakeLock();
   }
   updatePlayerUI(); 
   updatePlayingStates();
@@ -1473,43 +1912,77 @@ function togglePlayPause() {
 function seekTo(e) {
   if(!state.currentTrack) return;
   const bar = document.getElementById('progressBar');
+  if (!bar) return;
   const rect = bar.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const cx = getEventClientX(e);
+  const ratio = Math.max(0, Math.min(1, (cx - rect.left) / rect.width));
   
   if(state.playbackMode === 'youtube' && ytPlayer) {
-      ytPlayer.seekTo(ratio * ytPlayer.getDuration(), true);
+    ytPlayer.seekTo(ratio * ytPlayer.getDuration(), true);
   } else {
-      audio.currentTime = ratio * (audio.duration || 0);
+    audio.currentTime = ratio * (audio.duration || 0);
   }
 }
 
 // ── 3. SES VE İLERLEME ÇUBUĞU (PROGRESS BAR) GÜNCELLEMELERİ ──
 function updateVolumeFromEvent(e) {
   const bar = document.getElementById('volumeBar');
+  if (!bar) return;
   const rect = bar.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const cx = getEventClientX(e);
+  const ratio = Math.max(0, Math.min(1.0, (cx - rect.left) / rect.width));
   
+  initAudioEngine();
   state.volume = ratio; 
   state.isMuted = false; 
-  audio.volume = Math.min(1, ratio);
-  
-  if(ytPlayerReady && ytPlayer) ytPlayer.setVolume(ratio * 100);
-  
-  document.getElementById('volumeFill').style.width = `${ratio * 100}%`; 
-  updateVolumeIcon();
+  applyVolumeSettings();
 }
 
 function toggleMute() {
+  initAudioEngine();
   state.isMuted = !state.isMuted;
-  if(state.isMuted) { 
-      audio.volume = 0; 
-      if(ytPlayerReady && ytPlayer) ytPlayer.setVolume(0); 
-  } else { 
-      audio.volume = Math.min(1, state.volume); 
-      if(ytPlayerReady && ytPlayer) ytPlayer.setVolume(state.volume * 100); 
+  applyVolumeSettings();
+}
+
+function updateVolumeIcon() {
+  const high = document.getElementById('iconVolumeHigh');
+  const mute = document.getElementById('iconVolumeMuted');
+  const isSilent = state.isMuted || state.volume === 0;
+  if (high) high.style.display = isSilent ? 'none' : 'block';
+  if (mute) mute.style.display = isSilent ? 'block' : 'none';
+}
+
+function updateVolumeUI() {
+  const badge = document.getElementById('volumeBadge');
+  const boostBtn = document.getElementById('btnPlayerBoost');
+  const fill = document.getElementById('volumeFill');
+  const basePct = Math.round(state.volume * 100);
+
+  if (fill) {
+    fill.style.width = state.isMuted ? '0%' : `${basePct}%`;
   }
-  document.getElementById('volumeFill').style.width = state.isMuted ? '0%' : `${state.volume * 100}%`; 
+
+  if (badge) {
+    if (state.isMuted) {
+      badge.textContent = 'MUTE';
+      badge.classList.remove('boosted');
+    } else if (state.isBoosted) {
+      const modeExtra = state.audioMode === 'boost' ? 1.35 : 1.0;
+      const boostedVal = Math.round(basePct * state.boostMultiplier * modeExtra);
+      badge.textContent = `🔥 ${boostedVal}%`;
+      badge.classList.add('boosted');
+    } else {
+      badge.textContent = `${basePct}%`;
+      badge.classList.remove('boosted');
+    }
+  }
+
+  if (boostBtn) {
+    boostBtn.classList.toggle('active', state.isBoosted);
+  }
+
   updateVolumeIcon();
+  syncSettingsUI();
 }
 
 audio.addEventListener('timeupdate', () => { 
@@ -1520,84 +1993,687 @@ audio.addEventListener('timeupdate', () => {
     document.getElementById('progressFill').style.width = `${(c / d) * 100}%`; 
     document.getElementById('currentTime').textContent = formatTime(c); 
     document.getElementById('totalTime').textContent = formatTime(d); 
+
+    // Kilit ekranı / bildirim çubuğu süre göstergesi
+    if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession && c <= d) {
+      try {
+        navigator.mediaSession.setPositionState({
+          duration: d,
+          playbackRate: audio.playbackRate || 1,
+          position: Math.min(c, d)
+        });
+      } catch(e) {}
+    }
   }
   syncLyrics(c);
-  updateMediaSessionPosition();
 });
 
-// ── Arka planda çalmaya devam etme ──
-// Sekme arka plana atıldığında bazı tarayıcılar AudioContext'i otomatik
-// suspend eder (özellikle nightcore/boost aktifken kullanılan Web Audio
-// graph'ı). Bu, sekme öne alınana kadar sessiz kalmaya sebep olur ve
-// bazı Android WebView'lerde audio elementini de durdurabilir. Aşağıdaki
-// handler sekme her görünür olduğunda context'i canlandırıp oynatmayı
-// senkronize ediyor; ayrıca arka plana geçişte context'i suspend ETMEMEK
-// için hiçbir şey yapmıyoruz (varsayılan davranış zaten devam ettirmek).
-
-// Sessiz "keep-alive" parçası: Chrome mobil bazen normal audio elementini
-// arka planda 10-30 saniye içinde askıya alabiliyor (agresif sekme kısıtlaması).
-// Ayrı, çok kısa ve sessiz bir audio elementini sürekli loop ile çalar halde
-// tutmak, tarayıcıya sekmenin "aktif ses üreten" bir sekme olduğunu daha
-// güçlü şekilde bildirir ve bazı cihazlarda kesilmeyi engeller. Bu, ana
-// audio elementinin YERİNE değil, ONUNLA BİRLİKTE çalışır.
-const KEEPALIVE_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
-const keepAliveAudio = new Audio(KEEPALIVE_SILENT_WAV);
-keepAliveAudio.loop = true;
-keepAliveAudio.volume = 0;
-keepAliveAudio.setAttribute('playsinline', '');
-
-function startKeepAlive() {
-  keepAliveAudio.play().catch(() => {});
-}
-function stopKeepAlive() {
-  keepAliveAudio.pause();
-}
-
-let wakeLock = null;
-async function requestWakeLock() {
-  if (!('wakeLock' in navigator)) return;
-  try {
-    wakeLock = await navigator.wakeLock.request('screen');
-    wakeLock.addEventListener('release', () => { wakeLock = null; });
-  } catch (e) { /* izin reddedilmiş veya desteklenmiyor, sessizce geç */ }
-}
-function releaseWakeLock() {
-  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
-}
-
+// Sayfa arka plana geçtiğinde ve geri geldiğinde ses motoru koruması
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     if (audioContext && audioContext.state === 'suspended') {
       audioContext.resume().catch(() => {});
     }
-    // Bazı mobil tarayıcılar sekme arka plandayken audio elementini
-    // "paused" durumuna sokabiliyor ama state.isPlaying hâlâ true kalıyor.
-    // Öne dönüldüğünde gerçek durumu senkronize ediyoruz.
-    if (state.isPlaying && state.playbackMode === 'audio' && audio.paused) {
-      audio.play().catch(() => {});
-    }
-    if (state.isPlaying) requestWakeLock();
-    updateMediaSessionPosition();
-    stopKeepAlive();
-  } else if (document.visibilityState === 'hidden') {
-    // Arka plana geçerken bilinçli olarak audio.pause() veya
-    // audioContext.suspend() ÇAĞIRMIYORUZ — arka planda çalmaya devam
-    // etmesinin sebebi bu. Sessiz keep-alive parçasını başlatıyoruz ki
-    // tarayıcı sekmeyi "aktif ses üretmiyor" diye askıya almasın.
-    if (state.isPlaying) startKeepAlive();
   }
 });
 
-// iOS Safari ve bazı Android tarayıcılarında AudioContext, kullanıcı
-// etkileşimi olmadan "interrupted" durumuna geçebiliyor (örn. gelen
-// arama, başka bir uygulamanın ses çalması). pagehide/pageshow ile de
-// aynı kurtarmayı yapıyoruz çünkü bazı tarayıcılar visibilitychange
-// yerine bunu tetikliyor.
-window.addEventListener('pageshow', () => {
-  if (audioContext && audioContext.state === 'suspended') {
-    audioContext.resume().catch(() => {});
+// ============================================
+// SPOFLIX - VİDEOLAR & VİDEO İZLEME SİSTEMİ
+// ============================================
+
+const CURATED_VIDEOS = [
+  {
+    id: 'vid_1',
+    youtubeId: 'qS9hXp_H3hA',
+    title: 'Tarkan - Şımarık (Official Video 4K)',
+    channel: 'Tarkan',
+    duration: '03:55',
+    category: 'turkish',
+    views: '88M izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=700&q=80',
+    desc: 'Türk pop müziğinin zamansız efsanesi Tarkan’ın tüm dünyayı sallayan klibi.'
+  },
+  {
+    id: 'vid_2',
+    youtubeId: '4NRXx6U8ABQ',
+    title: 'The Weeknd - Blinding Lights (Official Music Video)',
+    channel: 'The Weeknd',
+    duration: '04:22',
+    category: 'trend',
+    views: '840M izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1508700115892-45ecd05ae2ad?auto=format&fit=crop&w=700&q=80',
+    desc: 'Dünya listelerini altüst eden synth-pop şaheseri.'
+  },
+  {
+    id: 'vid_3',
+    youtubeId: 'oygrmJFKYZY',
+    title: 'Dua Lipa - Don\'t Start Now (Official Music Video)',
+    channel: 'Dua Lipa',
+    duration: '03:03',
+    category: 'global',
+    views: '690M izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&w=700&q=80',
+    desc: 'Disko ritimleri ve büyüleyici görsel yönetmenlik.'
+  },
+  {
+    id: 'vid_4',
+    youtubeId: 'eVTXPUF4Oz4',
+    title: 'Linkin Park - In The End (Official 4K Remastered)',
+    channel: 'Linkin Park',
+    duration: '03:38',
+    category: 'live',
+    views: '1.7B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1465847899084-d164df4dedc6?auto=format&fit=crop&w=700&q=80',
+    desc: 'Rock tarihinin en unutulmaz video kliplerinden biri.'
+  },
+  {
+    id: 'vid_5',
+    youtubeId: '09R8_2nJtjg',
+    title: 'Maroon 5 - Sugar (Official Music Video)',
+    channel: 'Maroon 5',
+    duration: '05:01',
+    category: 'trend',
+    views: '4.0B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1493225457124-cac612d2d12f?auto=format&fit=crop&w=700&q=80',
+    desc: 'Düğünleri basan Maroon 5 ve unutulmaz anlar.'
+  },
+  {
+    id: 'vid_6',
+    youtubeId: 'JGwWNGJdvx8',
+    title: 'Ed Sheeran - Shape of You (Official Music Video)',
+    channel: 'Ed Sheeran',
+    duration: '04:23',
+    category: 'global',
+    views: '6.2B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=700&q=80',
+    desc: 'Tüm zamanların en çok izlenen pop kliplerinden biri.'
+  },
+  {
+    id: 'vid_7',
+    youtubeId: '7wtfhZwyrcc',
+    title: 'Imagine Dragons - Believer (Official Music Video)',
+    channel: 'Imagine Dragons',
+    duration: '03:36',
+    category: 'trend',
+    views: '2.5B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1501386761578-eac5c94b800a?auto=format&fit=crop&w=700&q=80',
+    desc: 'Yüksek enerjili vuruşlar ve aksiyon dolu sinematografi.'
+  },
+  {
+    id: 'vid_8',
+    youtubeId: 'uelHwf8o7_U',
+    title: 'Eminem ft. Rihanna - Love The Way You Lie',
+    channel: 'Eminem',
+    duration: '04:26',
+    category: 'rap',
+    views: '2.7B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1509198397868-475647b2a1e5?auto=format&fit=crop&w=700&q=80',
+    desc: 'Sinematik hip-hop başyapıtı.'
+  },
+  {
+    id: 'vid_9',
+    youtubeId: 'YQHsXMglC9A',
+    title: 'Adele - Hello (Official Music Video)',
+    channel: 'Adele',
+    duration: '06:06',
+    category: 'global',
+    views: '3.1B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1516450360452-9312f5e86fc7?auto=format&fit=crop&w=700&q=80',
+    desc: 'Xavier Dolan yönetmenliğinde çekilen ikonik melankolik klip.'
+  },
+  {
+    id: 'vid_10',
+    youtubeId: 'RgKAFK5djSk',
+    title: 'Wiz Khalifa ft. Charlie Puth - See You Again',
+    channel: 'Wiz Khalifa',
+    duration: '03:57',
+    category: 'rap',
+    views: '6.1B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1518609878373-06d740f60d8b?auto=format&fit=crop&w=700&q=80',
+    desc: 'Hızlı ve Öfkeli serisinin efsaneleşen anma şarkısı.'
+  },
+  {
+    id: 'vid_11',
+    youtubeId: 'OPf0YbXqDm0',
+    title: 'Mark Ronson ft. Bruno Mars - Uptown Funk',
+    channel: 'Mark Ronson',
+    duration: '04:30',
+    category: 'trend',
+    views: '4.9B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1429962714451-bb934ecdc4ec?auto=format&fit=crop&w=700&q=80',
+    desc: 'Sokak dansları ve saf funk enerjisi.'
+  },
+  {
+    id: 'vid_12',
+    youtubeId: 'hT_nvWreIhg',
+    title: 'OneRepublic - Counting Stars (Official Music Video)',
+    channel: 'OneRepublic',
+    duration: '04:43',
+    category: 'trend',
+    views: '3.9B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1511379938547-c1f69419868d?auto=format&fit=crop&w=700&q=80',
+    desc: 'Ritmiyle büyüleyen küresel pop-rock klasiği.'
+  },
+  {
+    id: 'vid_13',
+    youtubeId: 'nfWlot6h_JM',
+    title: 'Taylor Swift - Shake It Off (Official Video)',
+    channel: 'Taylor Swift',
+    duration: '04:01',
+    category: 'global',
+    views: '3.4B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1520523839898-507125cd53c1?auto=format&fit=crop&w=700&q=80',
+    desc: 'Eğlenceli koreografiler ve renkli pop gösterisi.'
+  },
+  {
+    id: 'vid_14',
+    youtubeId: 'CevxZvSJLk8',
+    title: 'Katy Perry - Roar (Official Video)',
+    channel: 'Katy Perry',
+    duration: '04:30',
+    category: 'global',
+    views: '3.8B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1506157786151-b8491531f063?auto=format&fit=crop&w=700&q=80',
+    desc: 'Ormanda hayatta kalma temalı eğlenceli ve renkli klip.'
+  },
+  {
+    id: 'vid_15',
+    youtubeId: 'fJ9rUzIMcZQ',
+    title: 'Queen - Bohemian Rhapsody (Official Video)',
+    channel: 'Queen Official',
+    duration: '06:00',
+    category: 'live',
+    views: '1.7B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1498038432885-c6f3f1b912ee?auto=format&fit=crop&w=700&q=80',
+    desc: 'Tarihin ilk modern müzik videosu.'
+  },
+  {
+    id: 'vid_16',
+    youtubeId: 'V1Pl8CzNzCw',
+    title: 'Billie Eilish - bad guy (Official Music Video)',
+    channel: 'Billie Eilish',
+    duration: '03:25',
+    category: 'trend',
+    views: '1.2B izlenme',
+    thumbnail: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=700&q=80',
+    desc: 'Yenilikçi, çılgın ve ödüllü pop klasiği.'
   }
-  if (state.isPlaying && state.playbackMode === 'audio' && audio.paused) {
-    audio.play().catch(() => {});
+];
+
+function initVideoModule() {
+  state.videoList = [...CURATED_VIDEOS];
+  renderVideoCategory('all');
+}
+
+function renderVideoCategory(cat = 'all') {
+  state.currentVideoCategory = cat;
+  
+  document.querySelectorAll('.video-pill').forEach(pill => {
+    pill.classList.toggle('active', pill.dataset.vcat === cat);
+  });
+
+  let filtered = CURATED_VIDEOS;
+  if (cat !== 'all') {
+    filtered = CURATED_VIDEOS.filter(v => v.category === cat);
   }
-});
+  
+  renderVideoGrid(filtered);
+}
+
+function filterVideoCategory(cat) {
+  renderVideoCategory(cat);
+}
+
+function renderVideoGrid(videos) {
+  const container = document.getElementById('videoGrid');
+  if (!container) return;
+
+  if (!videos || videos.length === 0) {
+    container.innerHTML = `
+      <div style="grid-column: 1 / -1; text-align: center; padding: 60px 20px; color: var(--text-secondary);">
+        <div style="font-size: 48px; margin-bottom: 12px;">🎬</div>
+        <h3 style="color: #fff; font-size: 18px; margin-bottom: 6px;">Aradığınız video bulunamadı</h3>
+        <p style="font-size: 13px;">Farklı bir kelime arayabilir veya YouTube üzerinden tüm videoları keşfedebilirsiniz.</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = videos.map((v, i) => {
+    const isPlayingThis = state.currentVideo && state.currentVideo.youtubeId === v.youtubeId;
+    return `
+      <div class="video-card ${isPlayingThis ? 'active' : ''}" onclick="openVideoPlayerByIndex(${i})">
+        <div class="video-card-thumb-wrap">
+          <img class="video-card-thumb" src="${v.thumbnail}" alt="${escapeHtml(v.title)}" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=600&q=80'">
+          <div class="video-card-overlay">
+            <div class="video-play-btn-circle">
+              <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+            </div>
+          </div>
+          <span class="video-card-hd-badge">HD 1080P</span>
+          <span class="video-card-duration">${v.duration || '03:45'}</span>
+        </div>
+        <div class="video-card-info">
+          <h4 class="video-card-title">${escapeHtml(v.title)}</h4>
+          <span class="video-card-channel">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
+            ${escapeHtml(v.channel)}
+          </span>
+          <span class="video-card-meta">${v.views || 'Trend Klip'}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function handleVideoSearchInput(query) {
+  clearTimeout(state.videoSearchTimeout);
+  const q = query.trim().toLowerCase();
+  
+  if (!q) {
+    renderVideoCategory(state.currentVideoCategory || 'all');
+    return;
+  }
+
+  state.videoSearchTimeout = setTimeout(async () => {
+    const localMatches = CURATED_VIDEOS.filter(v => 
+      v.title.toLowerCase().includes(q) || 
+      v.channel.toLowerCase().includes(q) ||
+      (v.desc && v.desc.toLowerCase().includes(q))
+    );
+
+    if (localMatches.length > 0) {
+      renderVideoGrid(localMatches);
+    } else {
+      // YouTube arama API fallback
+      showToast('YouTube videoları taranıyor...');
+      try {
+        const ytResults = await searchYouTube(q, 12);
+        if (ytResults && ytResults.length > 0) {
+          const mappedYt = ytResults.map(item => ({
+            id: item.id,
+            youtubeId: item.youtubeId,
+            title: item.name,
+            channel: item.artist,
+            duration: 'HD',
+            category: 'search',
+            views: 'YouTube',
+            thumbnail: item.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=600&q=80',
+            desc: item.name
+          }));
+          renderVideoGrid(mappedYt);
+          state.videoList = mappedYt;
+        } else {
+          renderVideoGrid([]);
+        }
+      } catch (err) {
+        console.warn('Video search error:', err);
+        renderVideoGrid([]);
+      }
+    }
+  }, 350);
+}
+
+function searchAndFilterVideos(term) {
+  navigateTo('videos');
+  const input = document.getElementById('videoSearchInput');
+  if (input) {
+    input.value = term;
+    handleVideoSearchInput(term);
+  }
+}
+
+function playHeroVideo() {
+  const heroVideo = CURATED_VIDEOS[0];
+  if (heroVideo) openVideoPlayer(heroVideo);
+}
+
+function openVideoPlayerByIndex(index) {
+  const video = (state.videoList && state.videoList[index]) || CURATED_VIDEOS[index];
+  if (video) openVideoPlayer(video);
+}
+
+let youtubeIframeApiPromise = null;
+
+function loadYouTubeIframeAPI() {
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (youtubeIframeApiPromise) return youtubeIframeApiPromise;
+
+  youtubeIframeApiPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      youtubeIframeApiPromise = null;
+      reject(new Error('YouTube oynatıcı zaman aşımına uğradı.'));
+    }, 15000);
+
+    const previousReady = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      if (typeof previousReady === 'function') {
+        try { previousReady(); } catch (e) { console.warn('YouTube ses oynatıcı başlatılamadı:', e); }
+      }
+      clearTimeout(timeout);
+      if (window.YT && window.YT.Player) resolve(window.YT);
+      else {
+        youtubeIframeApiPromise = null;
+        reject(new Error('YouTube oynatıcı yüklenemedi.'));
+      }
+    };
+
+    const fail = () => {
+      clearTimeout(timeout);
+      youtubeIframeApiPromise = null;
+      reject(new Error('YouTube oynatıcı yüklenemedi.'));
+    };
+    const existingScript = document.querySelector('script[src="https://www.youtube.com/iframe_api"]');
+    if (existingScript) {
+      existingScript.addEventListener('error', fail, { once: true });
+    } else {
+      const script = document.createElement('script');
+      script.src = 'https://www.youtube.com/iframe_api';
+      script.async = true;
+      script.onerror = fail;
+      document.head.appendChild(script);
+    }
+  });
+
+  return youtubeIframeApiPromise;
+}
+
+function destroyCurrentVideoPlayer() {
+  const player = state.currentVideoPlayer;
+  state.currentVideoPlayer = null;
+  if (player && typeof player.destroy === 'function') {
+    try { player.destroy(); } catch (e) {}
+  }
+}
+
+function openVideoUnavailable(container, video, errorCode) {
+  if (!container || !video) return;
+  const youtubeId = String(video.youtubeId || '').replace(/[^\w-]/g, '');
+  const explanation = errorCode === 101 || errorCode === 150
+    ? 'Bu klibin sahibi uygulama içinden oynatılmasına izin vermiyor.'
+    : errorCode === 153
+      ? 'YouTube oynatıcı kimliği doğrulanamadı.'
+      : 'Bu klip şu anda uygulama içinde oynatılamıyor.';
+
+  container.innerHTML = `
+    <div class="video-playback-fallback">
+      <div class="video-playback-fallback-content">
+        <span class="video-playback-fallback-icon">▶</span>
+        <h3>Video açılamadı</h3>
+        <p>${explanation}</p>
+        <a class="video-playback-fallback-link" href="https://www.youtube.com/watch?v=${youtubeId}" onclick="openVideoOnYouTube('${youtubeId}'); return false;">YouTube'da izle</a>
+      </div>
+    </div>
+  `;
+}
+
+function openVideoOnYouTube(videoId) {
+  const safeId = String(videoId || '').replace(/[^\w-]/g, '');
+  if (!safeId) return;
+  const url = `https://www.youtube.com/watch?v=${safeId}`;
+  try {
+    if (window.require) {
+      const electronApi = window.require('electron');
+      if (electronApi?.shell?.openExternal) {
+        electronApi.shell.openExternal(url).catch(() => window.open(url, '_blank', 'noopener'));
+        return;
+      }
+    }
+  } catch (e) {}
+  window.open(url, '_blank', 'noopener');
+}
+
+function handleVideoPlayerError(errorCode, token, container) {
+  if (token !== state.videoPlaybackToken) return;
+  const current = state.currentVideo;
+  const attemptedIds = new Set([...(current?.attemptedYoutubeIds || []), current?.youtubeId].filter(Boolean));
+  const fallback = (current && Array.isArray(current.fallbackVideos) ? current.fallbackVideos : [])
+    .filter((video) => video?.youtubeId && !attemptedIds.has(video.youtubeId));
+
+  // Track clip searches often return alternate uploads of the same clip.
+  // Try those automatically for video-specific errors; player configuration
+  // errors (such as 153) need a user-visible recovery link instead.
+  if ([100, 101, 150].includes(errorCode) && fallback.length > 0) {
+    const [next, ...remaining] = fallback;
+    showToast('Bu klip açılamadı; başka bir video deneniyor...');
+    setTimeout(() => {
+      if (token === state.videoPlaybackToken) {
+        openVideoPlayer({
+          ...next,
+          fallbackVideos: remaining,
+          attemptedYoutubeIds: [...attemptedIds],
+          fallbackSearchAttempted: Boolean(current?.fallbackSearchAttempted)
+        });
+      }
+    }, 350);
+    return;
+  }
+
+  if ([100, 101, 150].includes(errorCode) && current?.title && !current.fallbackSearchAttempted) {
+    current.fallbackSearchAttempted = true;
+    showToast('Bu klip açılmadı; oynatılabilir başka bir yükleme aranıyor...');
+    const query = `${current.title} ${current.channel || ''} official video`;
+    searchYouTube(query, 10).then((results) => {
+      if (token !== state.videoPlaybackToken) return;
+      const candidates = results
+        .filter((item) => item.youtubeId && !attemptedIds.has(item.youtubeId))
+        .map((item) => ({
+          id: item.id,
+          youtubeId: item.youtubeId,
+          title: item.name,
+          channel: item.artist,
+          duration: 'HD',
+          thumbnail: item.artwork || current.thumbnail || getDefaultArtwork(),
+          views: 'YouTube'
+        }));
+      if (candidates.length) {
+        const [next, ...remaining] = candidates;
+        openVideoPlayer({
+          ...next,
+          fallbackVideos: remaining,
+          attemptedYoutubeIds: [...attemptedIds],
+          fallbackSearchAttempted: true
+        });
+      } else {
+        openVideoUnavailable(container, current, errorCode);
+      }
+    }).catch(() => openVideoUnavailable(container, current, errorCode));
+    return;
+  }
+
+  openVideoUnavailable(container, current, errorCode);
+}
+
+function openVideoPlayer(video) {
+  if (!video) return;
+  const token = ++state.videoPlaybackToken;
+  destroyCurrentVideoPlayer();
+  state.currentVideo = video;
+
+  // Arka plandaki müzik sesini durdur
+  if (state.isPlaying) {
+    audio.pause();
+    state.isPlaying = false;
+    updatePlayerUI();
+  }
+
+  // Mini oynatıcı açıksa kapat
+  closeMiniVideoPlayer(false);
+
+  const modal = document.getElementById('videoModal');
+  const container = document.getElementById('videoIframeContainer');
+  const modalTitle = document.getElementById('videoModalTitle');
+  const modalChannel = document.getElementById('videoModalChannel');
+  const stageTitle = document.getElementById('videoStageTitle');
+  const stageChannel = document.getElementById('videoStageChannel');
+  const sidebarList = document.getElementById('videoSidebarList');
+  const sidebarCount = document.getElementById('videoSidebarCount');
+
+  if (modalTitle) modalTitle.textContent = video.title;
+  if (modalChannel) modalChannel.textContent = video.channel;
+  if (stageTitle) stageTitle.textContent = video.title;
+  if (stageChannel) stageChannel.textContent = video.channel;
+
+  // Responsive 16:9 YouTube Embed Player
+  if (container) {
+    const origin = window.location.origin || 'http://localhost:45678';
+    container.innerHTML = `
+      <iframe 
+        id="activeVideoIframe"
+        src="https://www.youtube.com/embed/${video.youtubeId}?autoplay=1&enablejsapi=1&rel=0&playsinline=1&origin=${encodeURIComponent(origin)}" 
+        title="${escapeHtml(video.title)}" 
+        referrerpolicy="origin"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+        allowfullscreen>
+      </iframe>
+    `;
+
+    loadYouTubeIframeAPI().then((YT) => {
+      if (token !== state.videoPlaybackToken || !document.getElementById('activeVideoIframe')) return;
+      const player = new YT.Player('activeVideoIframe', {
+        events: {
+          onReady: (event) => event.target.playVideo(),
+          onError: (event) => handleVideoPlayerError(event.data, token, container)
+        }
+      });
+      state.currentVideoPlayer = player;
+      const playerCreatedAt = Date.now();
+      let lastProgressAt = playerCreatedAt;
+      let lastPlaybackTime = 0;
+      const monitorPlayback = () => {
+        if (token !== state.videoPlaybackToken || state.currentVideoPlayer !== player) return;
+        try {
+          const playbackTime = Number(player.getCurrentTime()) || 0;
+          if (playbackTime > lastPlaybackTime + 0.25) {
+            lastPlaybackTime = playbackTime;
+            lastProgressAt = Date.now();
+          }
+          if (Date.now() - playerCreatedAt >= 20000 && Date.now() - lastProgressAt >= 12000) {
+            handleVideoPlayerError(101, token, container);
+            return;
+          }
+        } catch (e) {}
+        setTimeout(monitorPlayback, 2500);
+      };
+      setTimeout(monitorPlayback, 2500);
+    }).catch(() => {
+      if (token === state.videoPlaybackToken) openVideoUnavailable(container, video, 0);
+    });
+  }
+
+  // Sıradaki videolar listesi
+  if (sidebarList) {
+    const queue = CURATED_VIDEOS.filter(v => v.youtubeId !== video.youtubeId);
+    if (sidebarCount) sidebarCount.textContent = `${queue.length} video`;
+    sidebarList.innerHTML = queue.map(item => `
+      <div class="video-sidebar-item" onclick="openVideoPlayer(${JSON.stringify(item).replace(/"/g, '&quot;')})">
+        <div class="video-sidebar-thumb">
+          <img src="${item.thumbnail}" alt="" loading="lazy">
+        </div>
+        <div class="video-sidebar-info">
+          <span class="video-sidebar-name">${escapeHtml(item.title)}</span>
+          <span class="video-sidebar-channel">${escapeHtml(item.channel)} • ${item.duration}</span>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  if (modal) {
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+  }
+
+  showToast('🎬 ' + video.title + ' oynatılıyor');
+}
+
+function closeVideoPlayer() {
+  state.videoPlaybackToken++;
+  destroyCurrentVideoPlayer();
+  const modal = document.getElementById('videoModal');
+  const container = document.getElementById('videoIframeContainer');
+  if (container) container.innerHTML = '';
+  if (modal) {
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+  }
+}
+
+function minimizeVideoPlayer() {
+  if (!state.currentVideo) return;
+  const video = state.currentVideo;
+  closeVideoPlayer();
+
+  const miniPlayer = document.getElementById('videoMiniPlayer');
+  const miniContainer = document.getElementById('videoMiniFrameContainer');
+  const miniTitle = document.getElementById('videoMiniTitle');
+
+  if (miniTitle) miniTitle.textContent = video.title;
+  if (miniContainer) {
+    const origin = window.location.origin || 'http://localhost:45678';
+    miniContainer.innerHTML = `
+      <iframe 
+        src="https://www.youtube.com/embed/${video.youtubeId}?autoplay=1&enablejsapi=1&rel=0&playsinline=1&origin=${encodeURIComponent(origin)}" 
+        title="${escapeHtml(video.title)}" 
+        referrerpolicy="origin"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+        allowfullscreen>
+      </iframe>
+    `;
+  }
+  if (miniPlayer) miniPlayer.classList.add('show');
+}
+
+function restoreVideoPlayer() {
+  if (!state.currentVideo) return;
+  const video = state.currentVideo;
+  closeMiniVideoPlayer();
+  openVideoPlayer(video);
+}
+
+function closeMiniVideoPlayer(clearCurrent = true) {
+  const miniPlayer = document.getElementById('videoMiniPlayer');
+  const miniContainer = document.getElementById('videoMiniFrameContainer');
+  if (miniContainer) miniContainer.innerHTML = '';
+  if (miniPlayer) miniPlayer.classList.remove('show');
+  if (clearCurrent) state.currentVideo = null;
+}
+
+function toggleTheaterMode() {
+  const dialog = document.getElementById('videoModalDialog');
+  if (dialog) dialog.classList.toggle('theater-mode');
+}
+
+async function openCurrentTrackVideo() {
+  if (!state.currentTrack) {
+    navigateTo('videos');
+    playHeroVideo();
+    return;
+  }
+
+  const t = state.currentTrack;
+  showToast(`"${t.name}" klibi aranıyor... 🎬`);
+
+  // YouTube'da şarkı klibini ara
+  try {
+    const q = `${t.artist} ${t.name} official video`;
+    const results = await searchYouTube(q, 3);
+    if (results && results.length > 0) {
+      const candidates = results.map((item) => ({
+        id: item.id,
+        youtubeId: item.youtubeId,
+        title: item.name,
+        channel: item.artist,
+        duration: 'HD',
+        thumbnail: item.artwork || t.artwork,
+        views: 'YouTube'
+      }));
+      openVideoPlayer({ ...candidates[0], fallbackVideos: candidates.slice(1) });
+    } else {
+      showToast('Klip bulunamadı, Video kataloğu açılıyor.');
+      navigateTo('videos');
+    }
+  } catch (err) {
+    console.warn('Current track video search error:', err);
+    navigateTo('videos');
+  }
+}

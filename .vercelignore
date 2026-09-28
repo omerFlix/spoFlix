@@ -1,0 +1,11 @@
+node_modules
+release
+local-secrets.json
+.env
+.env.*
+.git
+.vercel
+.vscode
+README.md
+main.js
+server.js

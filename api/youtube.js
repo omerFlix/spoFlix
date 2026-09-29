@@ -1,3 +1,9 @@
+function durationInSeconds(value) {
+  const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(value || '');
+  if (!match) return 0;
+  return Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0);
+}
+
 module.exports = async function youtubeSearch(request, response) {
   if (request.method !== 'GET') {
     response.setHeader('Allow', 'GET');
@@ -34,7 +40,28 @@ module.exports = async function youtubeSearch(request, response) {
       response.status(502).json({ error: 'YouTube search failed' });
       return;
     }
-    const items = (data.items || []).filter((item) => item.id?.videoId).map((item) => ({
+    const searchItems = (data.items || []).filter((item) => item.id?.videoId);
+    const durations = new Map();
+    if (searchItems.length) {
+      try {
+        const detailsUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
+        detailsUrl.searchParams.set('part', 'contentDetails');
+        detailsUrl.searchParams.set('id', searchItems.map((item) => item.id.videoId).join(','));
+        detailsUrl.searchParams.set('key', apiKey);
+        const detailsResponse = await fetch(detailsUrl);
+        if (detailsResponse.ok) {
+          const details = await detailsResponse.json();
+          for (const video of details.items || []) {
+            durations.set(video.id, durationInSeconds(video.contentDetails?.duration));
+          }
+        } else {
+          console.warn('YouTube duration lookup failed:', detailsResponse.status);
+        }
+      } catch (error) {
+        console.warn('YouTube duration lookup failed:', error.message);
+      }
+    }
+    const items = searchItems.map((item) => ({
       id: `youtube_${item.id.videoId}`,
       youtubeId: item.id.videoId,
       name: item.snippet.title,
@@ -43,7 +70,8 @@ module.exports = async function youtubeSearch(request, response) {
       artwork: item.snippet.thumbnails?.high?.url || '',
       artworkSmall: item.snippet.thumbnails?.medium?.url || '',
       previewUrl: '',
-      duration: 0,
+      duration: durations.get(item.id.videoId) || 0,
+      source: 'youtube',
       isFullSong: true
     }));
     response.setHeader('Cache-Control', 'public, max-age=60, s-maxage=180, stale-while-revalidate=300');

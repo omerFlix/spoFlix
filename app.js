@@ -824,7 +824,7 @@ function renderTrackListItem(track,index, context = 'playlist') {
   const trackIdStr = String(track.id).replace(/'/g, "\\'");
   const artistEsc = escapeHtml(track.artist || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\r\n]/g, ' ');
   const nameEsc = escapeHtml(track.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\r\n]/g, ' ');
-  return `<div class="track-list-item ${ip?'playing':''}" onclick="playFromContext('${context}', ${index})" data-track-id="${track.id}"><div><span class="track-list-number">${index+1}</span><span class="track-list-play-icon">${isPlayingIcon}</span></div><div class="track-list-info"><div class="track-list-art"><img src="${track.artworkSmall||track.artwork}" alt="" loading="lazy" onerror="this.src='${getDefaultArtwork()}'></div><div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name)}</div><div class="track-list-artist">${escapeHtml(track.artist)}</div></div></div><div class="track-list-album">${escapeHtml(track.album||'')}</div><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><button class="track-video-btn" onclick="event.stopPropagation();openTrackVideo(${artistEsc}, ${nameEsc}, '${trackIdStr}')" title="Klibi İzle 🎬"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg><span>Klip</span></button><button class="track-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')" title="Beğen"><svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 3?"/></svg></button><span class="track-list-duration">${d}</span></div></div>`;
+  return `<div class="track-list-item ${ip?'playing':''}" onclick="playFromContext('${context}', ${index})" data-track-id="${track.id}"><div><span class="track-list-number">${index+1}</span><span class="track-list-play-icon">${isPlayingIcon}</span></div><div class="track-list-info"><div class="track-list-art"><img src="${track.artworkSmall||track.artwork}" alt="" loading="lazy" onerror="this.src='${getDefaultArtwork()}'"></div><div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name)}</div><div class="track-list-artist">${escapeHtml(track.artist)}</div></div></div><div class="track-list-album">${escapeHtml(track.album||'')}</div><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><button class="track-video-btn" onclick="event.stopPropagation();openTrackVideo(${artistEsc}, ${nameEsc}, '${trackIdStr}')" title="Klibi İzle 🎬"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg><span>Klip</span></button><button class="track-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')" title="Beğen"><svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 3?"/></svg></button><span class="track-list-duration">${d}</span></div></div>`;
 }
 function playFromContext(context, idx) {
   if (context === 'search' || context === 'playlist') state.queue = [...state.currentPlaylistTracks];
@@ -1708,6 +1708,7 @@ document.addEventListener('click', (e) => {
 let ytPlayer = null;
 let ytPlayerReady = false;
 let ytTimeInterval = null;
+let pendingYoutubeTrack = null;
 
 const tag = document.createElement('script');
 tag.src = "https://www.youtube.com/iframe_api";
@@ -1734,9 +1735,20 @@ function onYouTubeIframeAPIReady() {
         ytPlayerReady = true; 
         ytPlayer.unMute();
         ytPlayer.setVolume(state.isMuted ? 0 : state.volume * 100); 
+        const pendingTrack = pendingYoutubeTrack;
+        pendingYoutubeTrack = null;
+        if (pendingTrack && state.currentTrack?.id === pendingTrack.id) playTrack(pendingTrack);
       },
       'onStateChange': onYtPlayerStateChange,
-      'onError': () => playNext()
+      'onError': (event) => {
+        const expectedVideoId = state.currentTrack?.youtubeId;
+        const failedVideoId = event.target?.getVideoData?.().video_id;
+        if (!expectedVideoId || (failedVideoId && failedVideoId !== expectedVideoId)) return;
+        clearInterval(ytTimeInterval);
+        state.isPlaying = false;
+        updatePlayerUI();
+        showToast('Bu YouTube videosu oynatılamıyor. Başka bir sonuç seç.');
+      }
     }
   });
   const hideYouTubePlayer = () => {
@@ -1783,15 +1795,36 @@ function onYtPlayerStateChange(event) {
 }
 
 // ── 2. OYNATMA VE KONTROL FONKSİYONLARI ──
+function stopCurrentPlayback() {
+  audio.pause();
+  if (ytPlayerReady && ytPlayer?.stopVideo) ytPlayer.stopVideo();
+  clearInterval(ytTimeInterval);
+  state.isPlaying = false;
+  state.audioReady = false;
+  document.getElementById('currentTime').textContent = '0:00';
+  document.getElementById('totalTime').textContent = '0:00';
+  document.getElementById('progressFill').style.width = '0%';
+}
+
 function playTrack(track) {
   if(!track) {
     state.errorCount++;
     if(state.errorCount < state.maxErrors) setTimeout(() => playNext(), 500);
     return;
   }
+  pendingYoutubeTrack = null;
 
   if (['apple-tr', 'apple-tr-fallback', 'turkish-featured'].includes(track.source)) {
     const lookupToken = ++state.playToken;
+    stopCurrentPlayback();
+    state.currentTrack = track;
+    state.playbackMode = 'youtube';
+    state.trackStartTime = Date.now();
+    state.lyricLines = [];
+    state.lyricTrackId = track.id;
+    state.activeLyricIndex = -1;
+    updatePlayerUI();
+    updatePlayingStates();
     showToast(`YouTube'da "${track.name}" aranıyor...`);
     (async () => {
       const query = `${track.name} ${track.artist}`;
@@ -1804,10 +1837,6 @@ function playTrack(track) {
       }) || matches[0];
       if (playable?.youtubeId) {
         playTrack({ ...track, previewUrl: '', youtubeId: playable.youtubeId, source: 'youtube' });
-      } else if (ytPlayerReady && ytPlayer) {
-        // Search results may be unavailable without a configured Data API key.
-        // Let the YouTube player search directly; never fall back to Apple audio.
-        playTrack({ ...track, previewUrl: '', youtubeQuery: query, source: 'youtube-search' });
       } else {
         showToast('YouTube sonucu bulunamadı. Biraz sonra tekrar dene.');
       }
@@ -1820,6 +1849,7 @@ function playTrack(track) {
   // Böylece araya başka bir şarkı seçimi girdiyse (kullanıcı hızlı tıkladıysa),
   // eski/bayat isteğin sonucu yeni şarkının üzerine yazamaz.
   const myToken = ++state.playToken;
+  stopCurrentPlayback();
 
   state.currentTrack = track; 
   state.audioReady = false; 
@@ -1832,7 +1862,6 @@ function playTrack(track) {
     loadLyricsForTrack(track);
   }
   
-  if (ytPlayerReady && ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
   const shouldPlay = true;
   initAudioEngine();
   applyAudioModeSettings();
@@ -1867,20 +1896,39 @@ function playTrack(track) {
     document.getElementById("currentTime").textContent = "0:00";
     document.getElementById("progressFill").style.width = "0%";
     
-    if (track.youtubeId) ytPlayer.loadVideoById(track.youtubeId);
-    else ytPlayer.loadPlaylist({ listType: 'search', list: track.youtubeQuery || (track.artist + ' ' + track.name), index: 0 });
+    if (!track.youtubeId) {
+      state.isPlaying = false;
+      showToast('Bu şarkı için YouTube videosu bulunamadı.');
+      updatePlayerUI();
+      updatePlayingStates();
+      return;
+    }
+    ytPlayer.loadVideoById(track.youtubeId);
     ytPlayer.unMute();
     ytPlayer.setVolume(state.isMuted ? 0 : Math.min(100, state.volume * 100));
     if (shouldPlay) {
       ytPlayer.playVideo();
       state.isPlaying = true;
     }
+  } else if (track.youtubeId) {
+    state.playbackMode = 'youtube';
+    state.isPlaying = false;
+    pendingYoutubeTrack = track;
+    showToast('YouTube oynatıcı hazırlanıyor...');
+    updatePlayerUI();
+    updatePlayingStates();
+    setTimeout(() => {
+      if (pendingYoutubeTrack?.id === track.id && state.currentTrack?.id === track.id) {
+        pendingYoutubeTrack = null;
+        showToast('YouTube oynatıcı hazır değil. Biraz sonra tekrar dene.');
+        updatePlayerUI();
+      }
+    }, 10000);
   } else {
     state.playbackMode = 'audio';
     state.isPlaying = false;
     showToast('Bu şarkı için oynatılabilir kaynak bulunamadı.');
     updatePlayerUI();
-    setTimeout(() => { if (myToken === state.playToken) playNext(); }, 1000);
   }
   updatePlayerUI(); 
   addToRecentlyPlayed(track); 

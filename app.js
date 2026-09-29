@@ -1187,6 +1187,7 @@ audio.addEventListener('canplay', () => { state.audioReady = true; });
 
 // Mobilde arka planda kesintisiz geçiş: setTimeout olmadan anında sonraki şarkıya geç
 audio.addEventListener('ended', () => {
+  if (state.playbackMode !== 'audio' || !state.currentTrack?.previewUrl) return;
   if (state.repeatMode === 2) {
     audio.currentTime = 0;
     audio.play().catch(() => {});
@@ -1197,11 +1198,17 @@ audio.addEventListener('ended', () => {
 });
 
 audio.addEventListener('error', (e) => {
+  if (state.playbackMode !== 'audio' || !state.currentTrack?.previewUrl) return;
+  const failedToken = state.playToken;
+  const failedTrackId = state.currentTrack.id;
   console.warn('Audio error:', e);
   state.errorCount++;
   if (state.errorCount < state.maxErrors) {
     showToast('Şarkı yüklenemedi, sonraki deneniyor...');
-    setTimeout(() => playNext(), 1000);
+    setTimeout(() => {
+      if (failedToken !== state.playToken || state.currentTrack?.id !== failedTrackId || state.playbackMode !== 'audio') return;
+      playNext();
+    }, 1000);
   } else {
     showToast('Çok fazla hata oluştu.');
     state.isPlaying = false;

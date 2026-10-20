@@ -8,11 +8,13 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win"
+    "dist": "electron-builder --win",
+    "build:tv": "esbuild app.js --target=chrome63 --outfile=app-tv.js --minify"
   },
   "devDependencies": {
     "electron": "^33.0.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.25.11"
   },
   "build": {
     "appId": "com.spoflix.app",
@@ -24,6 +26,7 @@
     "files": [
       "index.html",
       "app.js",
+      "app-tv.js",
       "style.css",
       "server.js",
       "main.js",

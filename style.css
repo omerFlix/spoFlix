@@ -3437,3 +3437,170 @@ iframe#ytplayer-container {
 .track-card-art img[src^='data:image/svg'], .yt-trend-card-art img[src^='data:image/svg'], .track-list-art img[src^='data:image/svg'] { image-rendering: auto; border-radius: 6px; }
 .track-card-art img { transition: opacity 0.3s ease; }
 .track-card-art img.loading { opacity: 0.5; }
+
+/* Samsung Smart TV / TV browser remote control layout */
+body.tv-mode {
+  --sidebar-width: 260px;
+  --player-height: 108px;
+  font-size: 18px;
+}
+
+body.tv-mode .sidebar {
+  padding: 18px 14px 22px;
+}
+
+body.tv-mode .nav-item {
+  min-height: 54px;
+  padding: 14px 16px;
+  font-size: 16px;
+}
+
+body.tv-mode .nav-item svg {
+  width: 22px;
+  height: 22px;
+}
+
+body.tv-mode .header {
+  height: 76px;
+  min-height: 76px;
+  flex-basis: 76px;
+  padding: 0 28px;
+}
+
+body.tv-mode .main-content {
+  padding: 14px 30px 132px;
+}
+
+body.tv-mode .hero-section {
+  min-height: 210px;
+}
+
+body.tv-mode .hero-title {
+  font-size: clamp(34px, 3.2vw, 52px);
+}
+
+.tv-remote-hint {
+  display: none;
+}
+
+body.tv-mode .tv-remote-hint {
+  display: block;
+  margin-top: 12px;
+  color: var(--text-secondary);
+  font-size: 15px;
+}
+
+body.tv-mode .section-title {
+  font-size: 25px;
+}
+
+body.tv-mode .turkey-trends-source {
+  font-size: 16px;
+}
+
+body.tv-mode .yt-trend-cards {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 20px;
+}
+
+body.tv-mode .yt-trend-card-name {
+  font-size: 17px;
+}
+
+body.tv-mode .yt-trend-card-artist,
+body.tv-mode .yt-trend-dur {
+  font-size: 14px;
+}
+
+body.tv-mode .yt-trend-card-play,
+body.tv-mode .yt-trend-card-like,
+body.tv-mode .card-like-btn {
+  opacity: 1;
+  transform: none;
+}
+
+body.tv-mode .player {
+  height: 108px;
+  grid-template-columns: minmax(150px, 1fr) minmax(260px, 1.5fr) minmax(100px, .8fr);
+  gap: 12px;
+  padding: 10px 18px;
+}
+
+body.tv-mode .player-track {
+  font-size: 17px;
+}
+
+body.tv-mode .control-btn,
+body.tv-mode .play-btn {
+  width: 48px;
+  height: 48px;
+}
+
+body.tv-mode .play-btn svg {
+  width: 22px;
+  height: 22px;
+}
+
+body.tv-mode :focus {
+  outline: 4px solid #1ed760 !important;
+  outline-offset: 4px;
+  box-shadow: 0 0 0 7px rgba(29, 185, 84, .24);
+  z-index: 5;
+}
+
+body.tv-mode [data-tv-focusable="true"] {
+  cursor: pointer;
+}
+
+body.tv-mode .toast.tv-playback-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  width: 80%;
+  max-width: 720px;
+  padding: 20px 24px;
+  border-radius: 14px;
+  background: #20202b;
+  color: #fff;
+  font-size: 18px;
+  pointer-events: auto;
+}
+
+body.tv-mode .tv-youtube-fallback {
+  flex: 0 0 auto;
+  padding: 12px 18px;
+  border-radius: 8px;
+  background: #1db954;
+  color: #07130b;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+@media (max-width: 900px) {
+  body.tv-mode .app-container {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  body.tv-mode .sidebar {
+    position: relative;
+    transform: none;
+    z-index: 1;
+    width: auto;
+  }
+
+  body.tv-mode .mobile-nav {
+    display: none !important;
+  }
+
+  body.tv-mode .player {
+    grid-template-columns: minmax(90px, .8fr) minmax(210px, 1.5fr) minmax(80px, .7fr);
+    gap: 8px;
+    padding: 8px 12px;
+  }
+
+  body.tv-mode .player-left .track-like-btn,
+  body.tv-mode .player-right > *:not(.lyrics-btn) {
+    display: none;
+  }
+}

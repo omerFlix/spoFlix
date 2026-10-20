@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SpoFlix - Müzik Dinle</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=20261020-1"></head>
+    <link rel="stylesheet" href="style.css?v=20261020-tv2"></head>
 <body>
 
     <div class="app-container">
@@ -124,6 +124,7 @@
                         <div id="heroParticles" class="hero-particles"></div>
                         <div class="hero-content">
                             <h1 class="hero-title">İyi Akşamlar</h1>
+                            <p class="tv-remote-hint">Uzaktan kumanda: ok tuşlarıyla gezin · OK ile seç · Geri: ana sayfa</p>
                         </div>
                     </div>
 
@@ -471,7 +472,15 @@
         </div>
     </div>
 
-        <script src="app.js?v=20261020-1"></script>
+        <script>
+            (function () {
+                var userAgent = navigator.userAgent || '';
+                var isTvBrowser = /(SMART-TV|Tizen|Android TV|GoogleTV|BRAVIA|webOS)/i.test(userAgent);
+                var appScript = document.createElement('script');
+                appScript.src = isTvBrowser ? 'app-tv.js?v=20261020-tv2' : 'app.js?v=20261020-tv2';
+                document.body.appendChild(appScript);
+            }());
+        </script>
     </body>
 </html>
 

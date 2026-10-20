@@ -20,6 +20,17 @@ const state = {
   searchQuery: '',
 };
 
+const isTvBrowser = /(SMART-TV|Tizen|Android TV|GoogleTV|BRAVIA|webOS)/i.test(navigator.userAgent || '');
+
+if (!Promise.allSettled) {
+  Promise.allSettled = function (values) {
+    return Promise.all(Array.from(values, (value) => Promise.resolve(value).then(
+      (result) => ({ status: 'fulfilled', value: result }),
+      (reason) => ({ status: 'rejected', reason })
+    )));
+  };
+}
+
 function readStoredArray(key) {
   try {
     const value = JSON.parse(localStorage.getItem(key) || '[]');
@@ -480,6 +491,200 @@ async function getTracksByGenre(g,l=50) {
 }
 
 // ── Navigation ──
+function getTvFocusableElements() {
+  const modal = document.querySelector('#settingsModal:not([hidden]), #loginModal:not([hidden])');
+  const root = modal || document;
+  return Array.from(root.querySelectorAll(
+    'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [data-tv-focusable="true"]'
+  )).filter((element) => {
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+  });
+}
+
+function makeTvElementsFocusable(root) {
+  if (!isTvBrowser || !root?.querySelectorAll) return;
+  root.querySelectorAll('.track-card, .track-list-item, .genre-card, .yt-trend-card').forEach((element) => {
+    if (element.hasAttribute('data-tv-focusable')) return;
+    element.setAttribute('data-tv-focusable', 'true');
+    element.setAttribute('tabindex', '0');
+    element.setAttribute('role', 'button');
+  });
+}
+
+function moveTvFocus(direction) {
+  const elements = getTvFocusableElements();
+  if (!elements.length) return;
+
+  const current = elements.includes(document.activeElement) ? document.activeElement : null;
+  if (!current) {
+    focusFirstTvElement(state.currentView);
+    return;
+  }
+
+  const currentRect = current.getBoundingClientRect();
+  const currentX = currentRect.left + currentRect.width / 2;
+  const currentY = currentRect.top + currentRect.height / 2;
+  let best = null;
+  let bestScore = Infinity;
+
+  elements.forEach((candidate) => {
+    if (candidate === current) return;
+    const rect = candidate.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const primary = direction === 'left' ? currentX - x
+      : direction === 'right' ? x - currentX
+      : direction === 'up' ? currentY - y
+      : y - currentY;
+    if (primary <= 1) return;
+    const secondary = direction === 'left' || direction === 'right'
+      ? Math.abs(y - currentY)
+      : Math.abs(x - currentX);
+    const score = primary + secondary * 1.35;
+    if (score < bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  });
+
+  if (best) {
+    best.focus();
+    best.scrollIntoView(false);
+  }
+}
+
+function focusFirstTvElement(view) {
+  if (!isTvBrowser) return;
+  const viewElement = document.getElementById(`view-${view || state.currentView}`);
+  const candidates = getTvFocusableElements();
+  const target = (view === 'home' || !view)
+    ? document.querySelector('.nav-item[data-view="home"]')
+    : viewElement?.querySelector('input:not([disabled]), button:not([disabled]), [data-tv-focusable="true"]');
+  const visibleTarget = target && candidates.includes(target) ? target : null;
+  (visibleTarget || document.querySelector('.nav-item.active') || candidates[0])?.focus();
+}
+
+function initializeTvControls() {
+  if (!isTvBrowser) return;
+  document.body.classList.add('tv-mode');
+  makeTvElementsFocusable(document);
+  if (window.MutationObserver) {
+    const observer = new MutationObserver((records) => {
+      records.forEach((record) => record.addedNodes.forEach((node) => {
+        if (node.nodeType === 1) makeTvElementsFocusable(node);
+      }));
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+}
+
+function handleTvRemoteKey(event) {
+  if (!isTvBrowser) return false;
+  const code = event.keyCode || event.which;
+  const key = event.key || '';
+  const target = event.target;
+  const isTextEntry = target && (
+    target.isContentEditable ||
+    /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)
+  );
+
+  if (key === 'Back' || key === 'GoBack' || key === 'BrowserBack' || key === 'Escape' || code === 10009) {
+    const settings = document.getElementById('settingsModal');
+    const login = document.getElementById('loginModal');
+    const profile = document.getElementById('profileMenu');
+    if (settings && !settings.hidden) closeSettings();
+    else if (login && !login.hidden) closeLogin();
+    else if (profile && !profile.hidden) toggleProfileMenu();
+    else if (state.currentView !== 'home') navigateTo('home');
+    else return false;
+    event.preventDefault();
+    setTimeout(() => focusFirstTvElement(state.currentView), 0);
+    return true;
+  }
+
+  if (isTextEntry) return false;
+
+  const directions = {
+    ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down',
+  };
+  const direction = directions[key] || ({ 37: 'left', 39: 'right', 38: 'up', 40: 'down' })[code];
+  if (direction) {
+    if (target?.tagName === 'INPUT' && target.type === 'range') return false;
+    event.preventDefault();
+    moveTvFocus(direction);
+    return true;
+  }
+
+  if (key === 'MediaPlayPause' || code === 10252) {
+    event.preventDefault();
+    togglePlayPause();
+    return true;
+  }
+  if (key === 'MediaPlay' || code === 415) {
+    event.preventDefault();
+    if (!state.isPlaying) togglePlayPause();
+    return true;
+  }
+  if (key === 'MediaPause' || code === 19) {
+    event.preventDefault();
+    if (state.isPlaying) togglePlayPause();
+    return true;
+  }
+  if (key === 'MediaTrackNext' || code === 10233) {
+    event.preventDefault();
+    playNext();
+    return true;
+  }
+  if (key === 'MediaTrackPrevious' || code === 10232) {
+    event.preventDefault();
+    playPrev();
+    return true;
+  }
+  if (key === 'VolumeUp' || code === 447) {
+    event.preventDefault();
+    state.volume = Math.min(1, state.volume + 0.05);
+    state.isMuted = false;
+    applyVolumeSettings();
+    return true;
+  }
+  if (key === 'VolumeDown' || code === 448) {
+    event.preventDefault();
+    state.volume = Math.max(0, state.volume - 0.05);
+    state.isMuted = false;
+    applyVolumeSettings();
+    return true;
+  }
+  if (key === 'VolumeMute' || code === 449) {
+    event.preventDefault();
+    toggleMute();
+    return true;
+  }
+
+  if (key === 'Enter' || key === 'OK' || code === 13) {
+    if (target?.hasAttribute('data-tv-focusable')) {
+      event.preventDefault();
+      if (!event.repeat) target.click();
+      return true;
+    }
+    return false;
+  }
+
+  if (key === ' ' || key === 'Spacebar' || code === 32) {
+    if (target?.matches('button, a[href]')) return true;
+    if (target?.hasAttribute('data-tv-focusable')) {
+      event.preventDefault();
+      if (!event.repeat) target.click();
+    } else {
+      event.preventDefault();
+      togglePlayPause();
+    }
+    return true;
+  }
+
+  return false;
+}
+
 function navigateTo(v) {
   state.currentView=v;
   document.querySelectorAll('.view').forEach(el=>{el.style.display='none';el.classList.remove('active');});
@@ -498,6 +703,7 @@ function navigateTo(v) {
   else if(v==='liked') renderLikedSongs();
   else if(v==='library'){ renderRecentlyPlayed(); updateLikedCountDisplay(); }
   else if(v==='upload') renderMySongs();
+  if (isTvBrowser) setTimeout(() => focusFirstTvElement(v), 0);
 }
 function updateBgGradient(v) {
   const g=document.getElementById('mainBgGradient'),grads={home:'linear-gradient(180deg,rgba(29,185,84,0.15)0%,transparent 100%)',search:'linear-gradient(180deg,rgba(124,58,237,0.15)0%,transparent 100%)',library:'linear-gradient(180deg,rgba(59,130,246,0.15)0%,transparent 100%)',liked:'linear-gradient(180deg,rgba(124,58,237,0.2)0%,transparent 100%)',playlist:'linear-gradient(180deg,rgba(29,185,84,0.2)0%,transparent 100%)',upload:'linear-gradient(180deg,rgba(233,30,140,0.15)0%,transparent 100%)'};
@@ -1088,7 +1294,26 @@ function renderRecentlyPlayed() {
   window._gridData_recentlyPlayedGrid=state.recentlyPlayed.slice(0,12);
   grid.innerHTML=state.recentlyPlayed.slice(0,12).map((t,i)=>renderTrackCard(t,i,'recentlyPlayedGrid')).join('');
 }
-function showToast(msg) { const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._timeout); t._timeout=setTimeout(()=>t.classList.remove('show'),2500); }
+function showToast(msg) { const t=document.getElementById('toast'); t.textContent=msg; t.classList.remove('tv-playback-error'); t.classList.add('show'); clearTimeout(t._timeout); t._timeout=setTimeout(()=>t.classList.remove('show'),2500); }
+function showTvYoutubeFallback(track) {
+  const toast = document.getElementById('toast');
+  if (!toast || !track?.youtubeId) return;
+  while (toast.firstChild) toast.removeChild(toast.firstChild);
+  const message = document.createElement('span');
+  message.textContent = 'Bu şarkı TV tarayıcısında gömülü çalınamadı.';
+  const link = document.createElement('a');
+  link.href = `https://www.youtube.com/watch?v=${encodeURIComponent(track.youtubeId)}`;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.className = 'tv-youtube-fallback';
+  link.textContent = 'YouTube’da aç';
+  toast.appendChild(message);
+  toast.appendChild(link);
+  toast.classList.add('show', 'tv-playback-error');
+  clearTimeout(toast._timeout);
+  toast._timeout = setTimeout(() => toast.classList.remove('show', 'tv-playback-error'), 15000);
+  setTimeout(() => link.focus(), 0);
+}
 function formatTime(s) { if(!s||isNaN(s)) return '0:00'; const m=Math.floor(s/60),sec=Math.floor(s%60); return m+':'+sec.toString().padStart(2,'0'); }
 function escapeHtml(s) { if(!s) return ''; const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 function createHeroParticles() { const c=document.getElementById('heroParticles'); if(!c) return; c.innerHTML=''; for(let i=0;i<20;i++){ const p=document.createElement('div'); p.className='hero-particle'; p.style.left=Math.random()*100+'%'; p.style.top=Math.random()*100+'%'; p.style.animationDelay=Math.random()*6+'s'; p.style.animationDuration=(4+Math.random()*4)+'s'; p.style.width=(2+Math.random()*4)+'px'; p.style.height=p.style.width; c.appendChild(p); } }
@@ -1489,6 +1714,7 @@ async function removeCustomSong(dbId) {
   } catch (err) { console.error('Delete error:', err); showToast('Şarkı silinirken bir hata oluştu.'); }
 }
 async function initApp() {
+  initializeTvControls();
   createHeroParticles();
   initTheme();
   updateAudioModeUI();
@@ -1503,10 +1729,12 @@ async function initApp() {
       ? renderYouTubeTrendingList(state.youtubeTrendingTracks)
       : '<p class="youtube-trend-empty">YouTube Türkiye trendleri şu anda yüklenemedi.</p>';
   }
+  if (isTvBrowser) setTimeout(() => focusFirstTvElement('home'), 0);
   updateLikedCountDisplay();
   applyVolumeSettings();
 }
 document.addEventListener('keydown',(e)=>{
+  if (handleTvRemoteKey(e)) return;
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
   switch(e.code) {
     case 'Space': e.preventDefault(); togglePlayPause(); break;
@@ -1519,7 +1747,8 @@ document.addEventListener('keydown',(e)=>{
     case 'KeyS': if(e.ctrlKey){ e.preventDefault(); navigateTo('search'); } break;
   }
 });
-document.addEventListener('DOMContentLoaded', initApp);
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initApp);
+else initApp();
 
 // İlk kullanıcı etkileşiminde Web Audio API AudioContext'ini anında uyandır
 const unlockAudioOnGesture = () => {
@@ -1583,8 +1812,12 @@ function onYouTubeIframeAPIReady() {
         clearInterval(ytTimeInterval);
         state.isPlaying = false;
         updatePlayerUI();
-        showToast('Bu şarkı YouTube üzerinden oynatılamıyor. Başka bir şarkı seç.');
-      }
+        if (isTvBrowser) showTvYoutubeFallback(state.currentTrack);
+        else showToast('Bu şarkı YouTube üzerinden oynatılamıyor. Başka bir şarkı seç.');
+      },
+      'onAutoplayBlocked': () => {
+        if (isTvBrowser && state.currentTrack?.youtubeId) showTvYoutubeFallback(state.currentTrack);
+      },
     }
   });
   const hideYouTubePlayer = () => {

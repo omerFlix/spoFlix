@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SpoFlix - Müzik Dinle</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=20260928-6"></head>
+    <link rel="stylesheet" href="style.css?v=20261020-1"></head>
 <body>
 
     <div class="app-container">
@@ -39,10 +39,7 @@
                     <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
                     Ana Sayfa
                 </button>
-                <button class="nav-item" data-view="videos" onclick="navigateTo('videos')">
-                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4zM14 13h-3v3H9v-3H6v-2h3V8h2v3h3v2z"/></svg>
-                    Videolar <span style="margin-left:auto; font-size:10px; font-weight:800; background:linear-gradient(135deg,#ff0055,#ff5500); color:#fff; padding:2px 6px; border-radius:4px;">YENİ</span>
-                </button>
+                
                 <button class="nav-item" data-view="search" onclick="navigateTo('search')">
                     <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
                     Ara
@@ -130,70 +127,20 @@
                         </div>
                     </div>
 
-                    <div class="section-header">
-                        <h2 class="section-title">Türkiye Trendleri</h2>
-                        <span class="turkey-trends-source">Güncel liste · Lvbel C5 · Müslüm Gürses</span>
+                    <div class="section-header" style="align-items:center;">
+                        <div style="display:flex;align-items:center;gap:10px;">
+                            <span style="font-size:22px;">🔥</span>
+                            <div>
+                                <h2 class="section-title" style="margin:0;">YouTube Türkiye Trendleri</h2>
+                                <span class="turkey-trends-source" style="display:block;margin-top:2px;">Şu an en çok dinlenen şarkılar</span>
+                            </div>
+                        </div>
+                        <span class="yt-live-badge"><span class="yt-live-dot"></span>CANLI</span>
                     </div>
-                    <div id="turkeyTrendGrid" class="grid-container"></div>
-
-                    <div class="section-header">
-                        <h2 class="section-title">Haftanın Trendleri</h2>
-                    </div>
-                    <div id="trendingGrid" class="grid-container"></div>
-
-                    <div class="section-header">
-                        <h2 class="section-title">Yeni Çıkanlar</h2>
-                    </div>
-                    <div id="newReleasesGrid" class="grid-container"></div>
-
-                    <div class="section-header">
-                        <h2 class="section-title">Senin İçin Önerilenler</h2>
-                    </div>
-                    <div id="recommendedGrid" class="grid-container"></div>
+                    <div id="turkeyTrendGrid"></div>
                 </div>
 
                 <!-- YENİ VİDEOLAR KATEGORİSİ -->
-                <div id="view-videos" class="view">
-                    <!-- Hero Video Spotlight -->
-                    <div class="video-hero-banner" id="videoHeroBanner">
-                        <div class="video-hero-bg" id="videoHeroBg" style="background-image: url('https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=1200&q=80');"></div>
-                        <div class="video-hero-gradient"></div>
-                        <div class="video-hero-content">
-                            <span class="video-hero-badge">🔥 HAFTANIN EN ÇOK İZLENENİ</span>
-                            <h1 class="video-hero-title" id="videoHeroTitle">Tarkan - Şımarık (Official 4K Remastered)</h1>
-                            <p class="video-hero-desc" id="videoHeroDesc">Müzik dünyasının efsaneleşmiş video kliplerini ve en yeni hitleri ultra yüksek kalitede izleyin.</p>
-                            <div class="video-hero-actions">
-                                <button class="btn-hero-play" onclick="playHeroVideo()">
-                                    <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                                    <span>Hemen İzle</span>
-                                </button>
-                                <button class="btn-video-mode" style="padding:11px 20px; font-size:13px;" onclick="searchAndFilterVideos('türkçe')">
-                                    <span>🇹🇷 Türkçe Klipler</span>
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Toolbar: Search & Category Filter Pills -->
-                    <div class="video-toolbar">
-                        <div class="video-search-box">
-                            <svg class="video-search-icon" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-                            <input type="text" id="videoSearchInput" class="video-search-input" placeholder="Video klip, konser veya sanatçı ara..." oninput="handleVideoSearchInput(this.value)" autocomplete="off">
-                        </div>
-                        <div class="video-category-pills">
-                            <button class="video-pill active" data-vcat="all" onclick="filterVideoCategory('all')">Tüm Klipler</button>
-                            <button class="video-pill" data-vcat="trend" onclick="filterVideoCategory('trend')">🔥 Trendler</button>
-                            <button class="video-pill" data-vcat="turkish" onclick="filterVideoCategory('turkish')">🇹🇷 Türkçe Hit Klipler</button>
-                            <button class="video-pill" data-vcat="global" onclick="filterVideoCategory('global')">🌍 Dünya Hitleri</button>
-                            <button class="video-pill" data-vcat="rap" onclick="filterVideoCategory('rap')">🎤 Hip-Hop & Rap</button>
-                            <button class="video-pill" data-vcat="live" onclick="filterVideoCategory('live')">🎸 Akustik & Canlı</button>
-                        </div>
-                    </div>
-
-                    <!-- Video Grid -->
-                    <div id="videoGrid" class="video-grid"></div>
-                </div>
-
                 <div id="view-search" class="view">
                     <div style="margin-bottom: 24px; display: none;" id="searchPageInputContainer">
                         <input type="text" id="searchPageInput" class="form-input" placeholder="Sanatçı, şarkı veya podcast ara" oninput="handleSearch(this.value)" style="border-radius:500px; padding:16px 24px; font-size:16px;">
@@ -409,10 +356,7 @@
         </div>
 
         <div class="player-right">
-            <button id="btnVideoMode" class="btn-video-mode" onclick="openCurrentTrackVideo()" title="Çalan Şarkının Klibini İzle">
-                <svg viewBox="0 0 24 24"><path d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zm-10-3.5l6-4.5-6-4.5v9z"/></svg>
-                <span>Klip İzle</span>
-            </button>
+            
             <button class="control-btn" onclick="toggleMute()" aria-label="Ses">
                 <svg id="iconVolumeHigh" viewBox="0 0 24 24" fill="currentColor" style="display:block;"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
                 <svg id="iconVolumeMuted" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
@@ -454,10 +398,7 @@
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
             Ana Sayfa
         </button>
-        <button class="mobile-nav-item" data-view="videos" onclick="navigateTo('videos')">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg>
-            Videolar
-        </button>
+        
         <button class="mobile-nav-item" data-view="search" onclick="navigateTo('search'); document.getElementById('mobileSearchInputContainer').style.display='block';">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
             Ara
@@ -470,67 +411,6 @@
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
             Ortak Klasör
         </button>
-    </div>
-
-    <!-- Video Modal (Cinema Mode) -->
-    <div id="videoModal" class="video-modal" aria-hidden="true">
-        <div class="video-modal-backdrop" onclick="closeVideoPlayer()"></div>
-        <div class="video-modal-dialog" id="videoModalDialog">
-            <div class="video-modal-header">
-                <div class="video-modal-title-area">
-                    <span id="videoModalTitle" class="video-modal-title">Video Oynatıcı</span>
-                    <span id="videoModalChannel" class="video-modal-sub">SpoFlix Video Sinema</span>
-                </div>
-                <div class="video-modal-controls">
-                    <button class="video-control-btn" onclick="minimizeVideoPlayer()" title="Küçült (Mini Oynatıcı / PiP)">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11h-8v6h8v-6zm4 8V4.98C23 3.88 22.1 3 21 3H3c-1.1 0-2 .88-2 1.98V19c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2zm-2 .02H3V4.97h18v14.05z"/></svg>
-                        <span>Mini</span>
-                    </button>
-                    <button class="video-control-btn" onclick="toggleTheaterMode()" title="Sinema Modu">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6H5c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 10H5V8h14v8z"/></svg>
-                        <span>Genişlet</span>
-                    </button>
-                    <button class="video-close-btn" onclick="closeVideoPlayer()" title="Kapat">&times;</button>
-                </div>
-            </div>
-            <div class="video-modal-body">
-                <div class="video-stage">
-                    <div class="video-iframe-container" id="videoIframeContainer">
-                        <!-- YouTube player dynamically rendered here -->
-                    </div>
-                    <div class="video-details-bar">
-                        <div class="video-details-left">
-                            <span id="videoStageTitle" class="video-current-title">Video Başlığı</span>
-                            <span id="videoStageChannel" class="video-current-channel">Sanatçı / Kanal</span>
-                        </div>
-                        <div class="video-details-right">
-                            <button class="btn-boost" onclick="toggleBoost()" title="Ses Artırma / Boost">
-                                <span>⚡ BOOST</span>
-                            </button>
-                        </div>
-                    </div>
-                </div>
-                <div class="video-playlist-sidebar">
-                    <div class="video-sidebar-header">
-                        <span>Sıradaki Klipler</span>
-                        <span id="videoSidebarCount" style="color:var(--text-secondary);font-size:11px;">0 video</span>
-                    </div>
-                    <div id="videoSidebarList" class="video-sidebar-list"></div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Floating Picture-in-Picture Mini-Player -->
-    <div id="videoMiniPlayer" class="video-mini-player">
-        <div class="video-mini-header">
-            <span id="videoMiniTitle" class="video-mini-title">Klip Oynatılıyor</span>
-            <div class="video-mini-actions">
-                <button class="video-mini-btn" onclick="restoreVideoPlayer()" title="Tam Ekrana Al">⛶</button>
-                <button class="video-mini-btn" onclick="closeMiniVideoPlayer()" title="Kapat">&times;</button>
-            </div>
-        </div>
-        <div id="videoMiniFrameContainer" class="video-mini-frame"></div>
     </div>
 
     <!-- Toast Notification -->
@@ -591,7 +471,7 @@
         </div>
     </div>
 
-        <script src="app.js?v=20260928-9"></script>
+        <script src="app.js?v=20261020-1"></script>
     </body>
 </html>
 

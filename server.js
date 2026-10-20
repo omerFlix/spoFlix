@@ -13,6 +13,7 @@ const path = require('path');
 const urlMod = require('url');
 
 const ROOT = __dirname;
+const PUBLIC_API_BASE = 'https://spo-flix.vercel.app';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -43,15 +44,15 @@ const MIME = {
  * Tek bir HTTP isteğini işler (statik dosya servisi + range desteği).
  */
 function handleRequest(req, res) {
-  // CORS - yerel sunucudan yapılan çağrılar için gevşek izin
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges');
-
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     res.end();
+    return;
+  }
+  if (!['GET', 'HEAD'].includes(req.method)) {
+    res.setHeader('Allow', 'GET, HEAD, OPTIONS');
+    res.statusCode = 405;
+    res.end('Method Not Allowed');
     return;
   }
 
@@ -79,8 +80,23 @@ function handleRequest(req, res) {
     return;
   }
 
+  if (
+    pathname === '/local-secrets.json' || pathname.startsWith('/.env') ||
+    pathname === '/.git' || pathname.startsWith('/.git/') ||
+    pathname.startsWith('/node_modules/') || pathname.startsWith('/.vercel/')
+  ) {
+    res.statusCode = 404;
+    res.end('Not Found');
+    return;
+  }
+
   if (pathname === '/api/youtube') {
     handleYouTubeSearch(parsed, res);
+    return;
+  }
+
+  if (pathname === '/api/youtube-trending') {
+    handleYouTubeTrending(parsed, res);
     return;
   }
 
@@ -201,9 +217,9 @@ function startServer(port) {
     const server = http.createServer(handleRequest);
     server.on('error', reject);
     try {
-      server.listen(port, () => {
+      server.listen(port, '127.0.0.1', () => {
         resolve({
-          url: `http://localhost:${port}`,
+          url: `http://127.0.0.1:${port}`,
           server,
         });
       });
@@ -216,9 +232,37 @@ function startServer(port) {
 /**
  * Harici ses akışlarını yerel sunucu üzerinden yönlendirmeli olarak proxy eder.
  */
-function proxyAudioStream(targetUrl, req, res) {
+const ALLOWED_AUDIO_HOSTS = [
+  'audius.co', 'audius-content.com', 'altego.net', 'deezer.com', 'dzcdn.net',
+  'jamendo.com', 'jamendo.net', 'monophonic.digital', 'shakespearetech.com', 'soundhelix.com'
+];
+
+function parseAllowedAudioUrl(value) {
   try {
-    const client = targetUrl.startsWith('https:') ? https : http;
+    const target = new URL(value);
+    const hostname = target.hostname.toLowerCase();
+    const allowed = ALLOWED_AUDIO_HOSTS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+    if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password || !allowed) return null;
+    return target;
+  } catch (error) {
+    return null;
+  }
+}
+
+function proxyAudioStream(targetUrl, req, res, redirects = 0) {
+  const target = parseAllowedAudioUrl(targetUrl);
+  if (!target) {
+    res.statusCode = redirects ? 502 : 400;
+    res.end('Unsupported audio URL');
+    return;
+  }
+  if (redirects > 4) {
+    res.statusCode = 502;
+    res.end('Too many audio redirects');
+    return;
+  }
+  try {
+    const client = target.protocol === 'https:' ? https : http;
     const options = {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -228,14 +272,9 @@ function proxyAudioStream(targetUrl, req, res) {
     if (req.headers.range) {
       options.headers.range = req.headers.range;
     }
-    const proxyReq = client.get(targetUrl, options, (proxyRes) => {
+    const proxyReq = client.get(target, options, (proxyRes) => {
       if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-        let redirectUrl = proxyRes.headers.location;
-        if (!redirectUrl.startsWith('http')) {
-          const origin = new URL(targetUrl).origin;
-          redirectUrl = new URL(redirectUrl, origin).href;
-        }
-        proxyAudioStream(redirectUrl, req, res);
+        proxyAudioStream(new URL(proxyRes.headers.location, target).href, req, res, redirects + 1);
         return;
       }
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -287,6 +326,24 @@ function getYouTubeApiKey() {
   }
 }
 
+async function proxyPublicYouTubeApi(pathname, params, res) {
+  const target = new URL(pathname, PUBLIC_API_BASE);
+  for (const [key, value] of Object.entries(params)) target.searchParams.set(key, String(value));
+  try {
+    const upstream = await fetch(target);
+    const body = await upstream.text();
+    res.statusCode = upstream.status;
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', upstream.headers.get('cache-control') || 'no-store');
+    res.end(body);
+  } catch (error) {
+    console.warn('Public YouTube API proxy failed:', error.message);
+    res.statusCode = 502;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ error: 'YouTube service unavailable' }));
+  }
+}
+
 async function handleYouTubeSearch(parsed, res) {
   const query = (parsed.searchParams.get('q') || '').trim().slice(0, 150);
   const limit = Math.max(1, Math.min(25, Number(parsed.searchParams.get('limit')) || 10));
@@ -298,9 +355,7 @@ async function handleYouTubeSearch(parsed, res) {
     return;
   }
   if (!apiKey) {
-    res.statusCode = 503;
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.end(JSON.stringify({ error: 'YouTube search is not configured' }));
+    await proxyPublicYouTubeApi('/api/youtube', { q: query, limit }, res);
     return;
   }
 
@@ -328,8 +383,8 @@ async function handleYouTubeSearch(parsed, res) {
         if (detailsResponse.ok) {
           const details = await detailsResponse.json();
           for (const video of details.items || []) {
-            const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(video.contentDetails?.duration || '');
-            if (match) durations.set(video.id, Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0));
+            const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(video.contentDetails?.duration || '');
+            if (match) durations.set(video.id, Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Math.round(Number(match[3] || 0)));
           }
         } else {
           console.warn('YouTube duration lookup failed:', detailsResponse.status);
@@ -359,5 +414,60 @@ async function handleYouTubeSearch(parsed, res) {
     res.statusCode = 502;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.end(JSON.stringify({ error: 'YouTube search failed' }));
+  }
+}
+
+async function handleYouTubeTrending(parsed, res) {
+  const limit = Math.max(1, Math.min(25, Number(parsed.searchParams.get('limit')) || 25));
+  const apiKey = getYouTubeApiKey();
+  if (!apiKey) {
+    await proxyPublicYouTubeApi('/api/youtube-trending', { limit }, res);
+    return;
+  }
+
+  const target = new URL('https://www.googleapis.com/youtube/v3/videos');
+  target.searchParams.set('part', 'snippet,contentDetails');
+  target.searchParams.set('chart', 'mostPopular');
+  target.searchParams.set('regionCode', 'TR');
+  target.searchParams.set('videoCategoryId', '10');
+  target.searchParams.set('maxResults', String(limit));
+  target.searchParams.set('key', apiKey);
+
+  try {
+    const upstream = await fetch(target);
+    const data = await upstream.json();
+    if (!upstream.ok) throw new Error(`YouTube API HTTP ${upstream.status}`);
+    const items = (data.items || [])
+      .filter((video) => video.id && video.snippet?.liveBroadcastContent !== 'live' && video.snippet?.liveBroadcastContent !== 'upcoming')
+      .map((video) => {
+        const thumbnails = video.snippet?.thumbnails || {};
+        const artwork = thumbnails.maxres?.url || thumbnails.high?.url || thumbnails.medium?.url || '';
+        const artworkSmall = thumbnails.medium?.url || thumbnails.default?.url || artwork;
+        const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(video.contentDetails?.duration || '');
+        const duration = match
+          ? Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Math.round(Number(match[3] || 0))
+          : 0;
+        return {
+          id: `youtube_${video.id}`,
+          youtubeId: video.id,
+          name: video.snippet?.title || 'Bilinmeyen Video',
+          artist: video.snippet?.channelTitle || 'YouTube Kanalı',
+          album: 'YouTube Türkiye Trendleri',
+          artwork,
+          artworkSmall,
+          previewUrl: '',
+          duration,
+          source: 'youtube',
+          isFullSong: true
+        };
+      });
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=900');
+    res.end(JSON.stringify({ items }));
+  } catch (error) {
+    console.warn('YouTube trending request failed:', error.message);
+    res.statusCode = 502;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ error: 'YouTube trend list failed' }));
   }
 }

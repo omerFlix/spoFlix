@@ -7,9 +7,9 @@ const state = {
   currentView: 'home', currentTrack: null, queue: [], queueIndex: -1,
   isPlaying: false, isShuffle: false, repeatMode: 0, volume: 0.8, isMuted: false,
   errorCount: 0, maxErrors: 5, trackStartTime: 0, audioReady: false,
-  likedSongs: JSON.parse(localStorage.getItem('spoflix_liked') || '[]'),
-  recentlyPlayed: JSON.parse(localStorage.getItem('spoflix_recent') || '[]'),
-  mySongs: [], searchTimeout: null, currentPlaylistTracks: [], isSeeking: false,
+  likedSongs: readStoredArray('spoflix_liked'),
+  recentlyPlayed: readStoredArray('spoflix_recent'),
+  mySongs: [], searchTimeout: null, currentPlaylistTracks: [], youtubeTrendingTracks: [], isSeeking: false,
   playbackMode: 'audio',
   audiusHost: null, currentGenre: null, isLoadingMore: false, loadedTrackIds: new Set(),
   playToken: 0,
@@ -17,15 +17,18 @@ const state = {
   audioMode: localStorage.getItem('spoflix_audio_mode') || 'normal',
   isBoosted: localStorage.getItem('spoflix_boost') === 'true',
   boostMultiplier: 2.5,
-  currentVideo: null,
-  currentVideoPlayer: null,
-  videoPlaybackToken: 0,
-  currentVideoCategory: 'all',
-  videoSearchTimeout: null,
-  searchTab: 'all',
-  searchVideos: [],
   searchQuery: '',
 };
+
+function readStoredArray(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || '[]');
+    return Array.isArray(value) ? value : [];
+  } catch (error) {
+    console.warn(`Saved data for ${key} could not be read.`, error);
+    return [];
+  }
+}
 
 // ── IndexedDB ──
 let db = null;
@@ -206,40 +209,8 @@ function applyVolumeSettings() {
     ytPlayer.setVolume(ytVol);
   }
 
-  // 3. Electron IPC Booster: YouTube iframelerindeki video sesini doğrudan %250'ye kadar katla
-  try {
-    if (window.require) {
-      const { ipcRenderer } = window.require('electron');
-      if (ipcRenderer && ipcRenderer.send) {
-        ipcRenderer.send('set-volume-boost', {
-          multiplier: effectiveGain,
-          mode: state.audioMode
-        });
-      }
-    }
-  } catch (err) {}
-
-  // 4. Doğrudan DOM iframe video elemanlarına AudioContext Gain bağla (webSecurity: false)
-  try {
-    const frames = document.querySelectorAll('iframe');
-    for (const frame of frames) {
-      const win = frame.contentWindow;
-      if (!win) continue;
-      const video = win.document?.querySelector('video');
-      if (video) {
-        if (!win._spoflixCtx) {
-          const AudioCtx = win.AudioContext || win.webkitAudioContext;
-          win._spoflixCtx = new AudioCtx();
-          win._spoflixSource = win._spoflixCtx.createMediaElementSource(video);
-          win._spoflixGain = win._spoflixCtx.createGain();
-          win._spoflixSource.connect(win._spoflixGain);
-          win._spoflixGain.connect(win._spoflixCtx.destination);
-        }
-        if (win._spoflixCtx.state === 'suspended') win._spoflixCtx.resume();
-        win._spoflixGain.gain.value = effectiveGain;
-      }
-    }
-  } catch (err) {}
+  // Masaüstü uygulamasında ses ayarlarını yalnızca sınırlandırılmış preload köprüsüne ilet.
+  window.spoflixAudio?.setVolumeBoost({ multiplier: effectiveGain, mode: state.audioMode });
 
   updateVolumeUI();
 }
@@ -356,8 +327,24 @@ async function audiusFetch(e,p={}) {
   for (const[k,v] of Object.entries(p)) url.searchParams.append(k,v);
   try { const r=await fetch(url); if(!r.ok) throw new Error(`HTTP ${r.status}`); return (await r.json()).data; } catch(e) { console.error('Audius error:',e); return []; }
 }
-function getDefaultArtwork() {
-  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="#242438" width="100" height="100"/><text y="60" x="30" font-size="40">♫</text></svg>';
+function getDefaultArtwork(name, artist) {
+  const palettes = [
+    ['#1DB954','#16a085'],['#e91e8c','#9b59b6'],['#f39c12','#e74c3c'],
+    ['#3498db','#2980b9'],['#8e44ad','#2c3e50'],['#e67e22','#c0392b'],
+    ['#27ae60','#2ecc71'],['#2980b9','#8e44ad'],['#c0392b','#e74c3c'],
+    ['#16a085','#1DB954']
+  ];
+  const text = name || artist || '';
+  const letter = (text || '♫').trim()[0].toUpperCase();
+  const idx = text ? Math.abs([...text].reduce((a,c)=>a+c.charCodeAt(0),0)) % palettes.length : 0;
+  const [c1, c2] = palettes[idx];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+    <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="${c1}"/><stop offset="100%" stop-color="${c2}"/>
+    </linearGradient></defs>
+    <rect fill="url(#g)" width="100" height="100"/>
+    <text y="64" x="50" text-anchor="middle" font-size="42" font-family="Arial,sans-serif" font-weight="bold" fill="rgba(255,255,255,0.9)">${letter}</text>
+  </svg>`;
   return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
 function mapAudiusTrack(track) {
@@ -370,14 +357,7 @@ function mapAudiusTrack(track) {
   } else {
     url = `${host}/v1/tracks/${track.id}/stream?app_name=${APP_NAME}`;
   }
-  return { id:'audius_'+track.id, name:track.title||'Bilinmeyen Şarkı', artist:track.user?.name||'Bilinmeyen Sanatçı', album:track.album||track.genre||'Single', artwork:art['480x480']||art['150x150']||getDefaultArtwork(), artworkSmall:art['150x150']||art['480x480']||getDefaultArtwork(), previewUrl:url, duration:track.duration||0, genre:track.genre||'', isFullSong:true };
-}
-function mapITunesTrack(track) {
-  const l=track.artworkUrl100?track.artworkUrl100.replace('100x100','600x600'):getDefaultArtwork(),s=track.artworkUrl100||getDefaultArtwork();
-  return { id:'itunes_'+track.trackId, name:track.trackName||'Bilinmeyen Şarkı', artist:track.artistName||'Bilinmeyen Sanatçı', album:track.collectionName||'Single', artwork:l, artworkSmall:s, previewUrl:track.previewUrl||'', duration:Math.round((track.trackTimeMillis||0)/1000), genre:track.primaryGenreName||'', isFullSong:false };
-}
-async function searchITunes(q,l=25,country='') {
-  try { const countryParam=country?`&country=${encodeURIComponent(country)}`:''; const r=await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=${l}${countryParam}`); if(!r.ok) throw new Error(`HTTP ${r.status}`); return (await r.json()).results.map(mapITunesTrack); } catch(e) { console.error('iTunes error:',e); return []; }
+  return { id:'audius_'+track.id, name:track.title||'Bilinmeyen Şarkı', artist:track.user?.name||'Bilinmeyen Sanatçı', album:track.album||track.genre||'Single', artwork:art['480x480']||art['150x150']||getDefaultArtwork(track.title, track.user?.name), artworkSmall:art['150x150']||art['480x480']||getDefaultArtwork(track.title, track.user?.name), previewUrl:url, duration:track.duration||0, genre:track.genre||'', isFullSong:true };
 }
 async function searchJamendo(q,l=25) {
   try {
@@ -394,8 +374,8 @@ async function searchJamendo(q,l=25) {
       name: t.name || 'Bilinmeyen Şarkı',
       artist: t.artist_name || 'Bilinmeyen Sanatçı',
       album: t.album_name || 'Single',
-      artwork: t.album_image || getDefaultArtwork(),
-      artworkSmall: t.album_image || getDefaultArtwork(),
+      artwork: t.album_image || getDefaultArtwork(t.name, t.artist_name),
+      artworkSmall: t.album_image || getDefaultArtwork(t.name, t.artist_name),
       previewUrl: t.audio,
       duration: t.duration || 0,
       genre: t.musicinfo?.tags?.genres?.join(', ') || '',
@@ -413,82 +393,51 @@ async function searchYouTube(q,l=10) {
     return (await r.json()).items || [];
   } catch (e) { console.error('YouTube search error:', e); return []; }
 }
-
-const TURKISH_CHART_FALLBACK = [
-  ['Kayıp Kalp', 'BLOK3'],
-  ['Sebebi Yar', 'BLOK3'],
-  ['Çok Güzel Gülüyorsun', 'BLOK3, Poizi'],
-  ['Döndüm', 'Bora Duran'],
-  ['Toz Pembe', 'manifest'],
-  ['Hileli', 'manifest, Ajda Pekkan'],
-  ['Kırgınım', 'BLOK3'],
-  ['KUSURA BAKMA', 'BLOK3'],
-  ['Benim Olsana', 'CRUSH'],
-  ['Ara Beni', 'Hadise'],
-  ['Değiştiremezsin Yazılmışsa', 'BLOK3'],
-  ['Gamsız Hayat', 'Candan Erçetin'],
-  ['YIN YANG', 'Motive'],
-  ['Bana Ne Bu Sevdalardan', 'Ezhel'],
-  ['Ha Leylim', 'Mabel Matiz']
-];
-
-async function getTurkishTrendingTracks(limit = 20) {
-  const chartUrl = 'https://rss.applemarketingtools.com/api/v2/tr/music/most-played/25/songs.json';
-  const [chartResult, lvbelTracks, muslimTracks] = await Promise.allSettled([
-    fetch(chartUrl).then((response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return response.json();
-    }),
-    searchITunes('Lvbel C5', 6, 'tr'),
-    searchITunes('Müslüm Gürses', 6, 'tr')
-  ]);
-
-  const chartSongs = chartResult.status === 'fulfilled'
-    ? (chartResult.value.feed?.results || []).map((song, index) => ({
-        id: `apple_tr_${song.id || index}`,
-        name: song.name || 'Bilinmeyen Şarkı',
-        artist: song.artistName || 'Bilinmeyen Sanatçı',
-        album: song.albumName || 'Türkiye Trendleri',
-        artwork: (song.artworkUrl100 || getDefaultArtwork()).replace(/\d+x\d+bb\.(jpg|webp)/, '600x600bb.$1'),
-        artworkSmall: song.artworkUrl100 || getDefaultArtwork(),
-        previewUrl: '',
-        appleUrl: song.url || '',
-        duration: 0,
-        isFullSong: false,
-        source: 'apple-tr'
-      }))
-    : [];
-
-  const featured = [
-    ...(lvbelTracks.status === 'fulfilled' ? lvbelTracks.value : []),
-    ...(muslimTracks.status === 'fulfilled' ? muslimTracks.value : [])
-  ].map((track) => ({ ...track, previewUrl: '', source: 'apple-tr' }));
-  const chartTracks = chartSongs.length ? chartSongs : TURKISH_CHART_FALLBACK.map(([name, artist], index) => ({
-    id: `apple_tr_fallback_${index + 1}`,
-    name,
-    artist,
-    album: 'Apple Music Top 100: Türkiye',
-    artwork: getDefaultArtwork(),
-    artworkSmall: getDefaultArtwork(),
-    previewUrl: '',
-    appleUrl: 'https://music.apple.com/tr/playlist/top-100-t%C3%BCrkiye/pl.f3e0d6ef238542609572c18b0de1513b?l=tr',
-    duration: 0,
-    isFullSong: false,
-    source: 'apple-tr-fallback'
-  }));
-  const seen = new Set();
-  const tracks = [...featured, ...chartTracks].filter((track) => {
-    const key = `${track.name}|${track.artist}`.toLocaleLowerCase('tr-TR');
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-  return tracks.slice(0, limit);
+async function getYouTubeTrendingTracks(limit = 25) {
+  try {
+    const url = new URL('/api/youtube-trending', window.location.origin);
+    url.searchParams.set('limit', String(Math.max(1, Math.min(25, Number(limit) || 25))));
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return (await response.json()).items || [];
+  } catch (error) {
+    console.error('YouTube Türkiye trend listesi yüklenemedi:', error);
+    return [];
+  }
 }
+// Kapak görseli eksik şarkıları YouTube'dan eşleştir
+async function enrichTracksWithArtwork(tracks, maxBatch = 8) {
+  const missing = tracks.filter(t =>
+    !t.artwork || t.artwork === getDefaultArtwork() || t.artwork.startsWith('data:image/svg')
+  );
+  if (!missing.length) return tracks;
+  // Batch: en fazla maxBatch şarkı için YouTube'dan thumbnail çek
+  const batch = missing.slice(0, maxBatch);
+  const results = await Promise.allSettled(
+    batch.map(async (track) => {
+      try {
+        const q = `${track.artist} ${track.name}`;
+        const ytResults = await searchYouTube(q, 1);
+        if (ytResults && ytResults.length > 0 && ytResults[0].artwork) {
+          return { id: track.id, artwork: ytResults[0].artwork, artworkSmall: ytResults[0].artworkSmall || ytResults[0].artwork };
+        }
+      } catch (e) { /* ignore */ }
+      return null;
+    })
+  );
+  const artMap = {};
+  results.forEach(r => { if (r.status === 'fulfilled' && r.value) artMap[r.value.id] = r.value; });
+  return tracks.map(t => {
+    if (artMap[t.id]) return { ...t, artwork: artMap[t.id].artwork, artworkSmall: artMap[t.id].artworkSmall };
+    if (!t.artwork || t.artwork.startsWith('data:image/svg')) return { ...t, artwork: getDefaultArtwork(t.name, t.artist), artworkSmall: getDefaultArtwork(t.name, t.artist) };
+    return t;
+  });
+}
+
 function searchDeezer(q,l=25) {
   return new Promise((resolve)=>{
     const cb='deezer_cb_'+Date.now()+'_'+Math.floor(Math.random()*100000),s=document.createElement('script');
-    window[cb]=(d)=>{ delete window[cb]; if(s.parentNode) s.parentNode.removeChild(s); if(d&&d.data) resolve(d.data.slice(0,l).map(t=>({ id:'deezer_'+t.id, name:t.title||'Bilinmeyen Şarkı', artist:t.artist?.name||'Bilinmeyen Sanatçı', album:t.album?.title||'Single', artwork:t.album?.cover_xl||t.album?.cover_medium||getDefaultArtwork(), artworkSmall:t.album?.cover_small||t.album?.cover_medium||getDefaultArtwork(), previewUrl:t.preview||'', duration:t.duration||0, genre:'', isFullSong:false }))); else resolve([]); };
+    window[cb]=(d)=>{ delete window[cb]; if(s.parentNode) s.parentNode.removeChild(s); if(d&&d.data) resolve(d.data.slice(0,l).map(t=>({ id:'deezer_'+t.id, name:t.title||'Bilinmeyen Şarkı', artist:t.artist?.name||'Bilinmeyen Sanatçı', album:t.album?.title||'Single', artwork:t.album?.cover_xl||t.album?.cover_medium||getDefaultArtwork(t.title, t.artist?.name), artworkSmall:t.album?.cover_small||t.album?.cover_medium||getDefaultArtwork(t.title, t.artist?.name), previewUrl:t.preview||'', duration:t.duration||0, genre:'', isFullSong:false }))); else resolve([]); };
     s.onerror=()=>{ delete window[cb]; if(s.parentNode) s.parentNode.removeChild(s); resolve([]); };
     s.src=`https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=${l}&output=jsonp&callback=${cb}`;
     document.body.appendChild(s);
@@ -546,229 +495,101 @@ function navigateTo(v) {
     },100); 
     populateSearchGenres(); 
   }
-  else if(v==='videos') renderVideoCategory(state.currentVideoCategory || 'all');
   else if(v==='liked') renderLikedSongs();
   else if(v==='library'){ renderRecentlyPlayed(); updateLikedCountDisplay(); }
   else if(v==='upload') renderMySongs();
 }
 function updateBgGradient(v) {
-  const g=document.getElementById('mainBgGradient'),grads={home:'linear-gradient(180deg,rgba(29,185,84,0.15)0%,transparent 100%)',videos:'linear-gradient(180deg,rgba(124,58,237,0.25)0%,transparent 100%)',search:'linear-gradient(180deg,rgba(124,58,237,0.15)0%,transparent 100%)',library:'linear-gradient(180deg,rgba(59,130,246,0.15)0%,transparent 100%)',liked:'linear-gradient(180deg,rgba(124,58,237,0.2)0%,transparent 100%)',playlist:'linear-gradient(180deg,rgba(29,185,84,0.2)0%,transparent 100%)',upload:'linear-gradient(180deg,rgba(233,30,140,0.15)0%,transparent 100%)'};
+  const g=document.getElementById('mainBgGradient'),grads={home:'linear-gradient(180deg,rgba(29,185,84,0.15)0%,transparent 100%)',search:'linear-gradient(180deg,rgba(124,58,237,0.15)0%,transparent 100%)',library:'linear-gradient(180deg,rgba(59,130,246,0.15)0%,transparent 100%)',liked:'linear-gradient(180deg,rgba(124,58,237,0.2)0%,transparent 100%)',playlist:'linear-gradient(180deg,rgba(29,185,84,0.2)0%,transparent 100%)',upload:'linear-gradient(180deg,rgba(233,30,140,0.15)0%,transparent 100%)'};
   g.style.background=grads[v]||grads.home;
 }
 
 // ── Search ──
 function handleSearch(q) {
+  const query = String(q || '').trim();
   clearTimeout(state.searchTimeout);
   const si = document.getElementById('searchInput');
   const spi = document.getElementById('searchPageInput');
   if (si && si.value !== q) si.value = q;
   if (spi && spi.value !== q) spi.value = q;
-  if (state.currentView !== 'search') { navigateTo('search'); }
-  const rd = document.getElementById('searchResults'); if (!rd) return;
-  state.searchQuery = q;
+  if (state.currentView !== 'search') navigateTo('search');
 
-  if (q.length < 2) {
-    state.currentPlaylistTracks = [];
-    state.searchVideos = [];
-    rd.innerHTML = '<div class="section-header"><h2 class="section-title">Popüler Aramalar</h2></div><div class="genre-grid" id="searchGenreGrid"></div>';
+  const results = document.getElementById('searchResults');
+  if (!results) return;
+  state.searchQuery = query;
+  state.currentPlaylistTracks = [];
+
+  if (query.length < 2) {
+    results.innerHTML = '<div class="section-header"><h2 class="section-title">Popüler Aramalar</h2></div><div class="genre-grid" id="searchGenreGrid"></div>';
     populateSearchGenres();
     return;
   }
 
   state.searchTimeout = setTimeout(async () => {
-    rd.innerHTML = '<div class="loading-spinner"><div class="spinner"></div></div>';
-    const [yR, jR, iR, dR, aR] = await Promise.all([
-      searchYouTube(q, 12),
-      searchJamendo(q, 25),
-      searchITunes(q, 25),
-      searchDeezer(q, 25),
-      searchAudius(q, 25)
+    if (state.searchQuery !== query) return;
+    results.innerHTML = '<div class="loading-spinner" role="status" aria-label="Şarkılar aranıyor"><div class="spinner"></div></div>';
+
+    const responses = await Promise.allSettled([
+      searchYouTube(query, 15),
+      searchJamendo(query, 20),
+      searchDeezer(query, 20),
+      searchAudius(query, 20)
     ]);
-    const ql = q.toLowerCase().trim();
-    const n = (s) => (s || '').toLowerCase().replace(/[\s\p{P}\p{M}]/gu, '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    const qn = n(ql);
-    const isSub = (qt, t) => { let qi = 0; for (let ti = 0; ti < t.length && qi < qt.length; ti++) { if (t[ti] === qt[qi]) qi++; } return qi === qt.length; };
-    const score = (t) => { const a = (t.artist || '').toLowerCase(), nm = (t.name || '').toLowerCase(), an = n(a), nn = n(nm); if (a === ql) return 6; if (an === qn) return 5; if (a.includes(ql)) return 4; if (an.includes(qn)) return 3; if (isSub(qn, an)) return 2; if (nm.includes(ql) || nn.includes(qn)) return 1; return 0; };
-    const fs = (t) => t.map(t => ({ track: t, score: score(t) })).filter(s => s.score > 0).sort((a, b) => b.score - a.score).map(s => s.track);
-    const fY = yR, fJ = fs(jR), fI = fs(iR), fD = fs(dR), fA = fs(aR);
+    if (state.searchQuery !== query) return;
+
+    const valueOrEmpty = (result) => result.status === 'fulfilled' && Array.isArray(result.value) ? result.value : [];
+    const [youtubeTracks, jamendoTracks, deezerTracks, audiusTracks] = responses.map(valueOrEmpty);
+    const normalize = (value) => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('tr').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    const normalizedQuery = normalize(query);
+    const terms = normalizedQuery.split(/\s+/).filter(Boolean);
+    const candidates = [...youtubeTracks, ...audiusTracks, ...jamendoTracks, ...deezerTracks];
     const seen = new Set();
-    let tracks = [...fA, ...fJ, ...fY, ...fD, ...fI].filter(t => {
-      const k = `${(t.artist || '').toLowerCase()}|${(t.name || '').toLowerCase()}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
+    const tracks = candidates.filter((track) => {
+      if (!track || (!track.isFullSong && !String(track.id || '').startsWith('local_'))) return false;
+      const searchable = normalize(`${track.name || ''} ${track.artist || ''}`);
+      if (terms.some((term) => !searchable.includes(term))) return false;
+      const key = `${normalize(track.artist)}|${normalize(track.name)}`;
+      if (!track.name || !track.artist || seen.has(key)) return false;
+      seen.add(key);
       return true;
-    });
-    tracks = tracks.filter(t => t.isFullSong || t.id.startsWith('local_'));
-
-    // Video klipleri hazırla
-    let videos = (yR || []).map(item => ({
-      id: item.id,
-      youtubeId: item.youtubeId,
-      title: item.name,
-      channel: item.artist,
-      duration: 'HD Klip',
-      category: 'search',
-      views: 'YouTube',
-      thumbnail: item.artwork || getDefaultArtwork(),
-      desc: item.name
-    }));
-
-    // Küratörlü videolardan da uyuşan varsa başa ekle
-    const curatedMatches = CURATED_VIDEOS.filter(v =>
-      v.title.toLowerCase().includes(ql) ||
-      v.channel.toLowerCase().includes(ql) ||
-      (v.desc && v.desc.toLowerCase().includes(ql))
-    );
-    if (curatedMatches.length > 0) {
-      const vSeen = new Set(videos.map(v => v.youtubeId));
-      for (const cv of curatedMatches) {
-        if (!vSeen.has(cv.youtubeId)) {
-          videos.unshift(cv);
-          vSeen.add(cv.youtubeId);
-        }
-      }
-    }
+    }).slice(0, 60);
 
     state.currentPlaylistTracks = tracks;
-    state.searchVideos = videos;
-    state.currentGenre = q;
-
+    state.currentGenre = query;
     renderSearchResults();
-  }, 400);
-}
 
-function setSearchTab(tab) {
-  state.searchTab = tab;
-  renderSearchResults();
+    enrichTracksWithArtwork(tracks, 10).then((enriched) => {
+      if (state.searchQuery !== query || !enriched.length) return;
+      state.currentPlaylistTracks = enriched;
+      renderSearchResults();
+    }).catch((error) => console.warn('Search artwork lookup failed:', error));
+  }, 350);
 }
 
 function renderSearchResults() {
-  const rd = document.getElementById('searchResults');
-  if (!rd) return;
+  const results = document.getElementById('searchResults');
+  if (!results) return;
   const tracks = state.currentPlaylistTracks || [];
-  const videos = state.searchVideos || [];
-  const currentTab = state.searchTab || 'all';
 
-  if (tracks.length === 0 && videos.length === 0) {
-    rd.innerHTML = `
+  if (!tracks.length) {
+    results.innerHTML = `
       <div class="empty-state">
         <div class="empty-state-icon">🎧</div>
-        <h3 class="empty-state-title">Sonuç bulunamadı</h3>
-        <p class="empty-state-text">"${escapeHtml(state.searchQuery || '')}" için şarkı veya video klip bulunamadı. Farklı bir arama deneyin.</p>
+        <h3 class="empty-state-title">Şarkı bulunamadı</h3>
+        <p class="empty-state-text">"${escapeHtml(state.searchQuery || '')}" için sonuç bulunamadı. Başka bir şarkı veya sanatçı deneyin.</p>
       </div>`;
     return;
   }
 
-  let html = `
-    <div class="search-category-tabs">
-      <button type="button" class="search-tab-pill ${currentTab === 'all' ? 'active' : ''}" onclick="setSearchTab('all')">✨ Tümü</button>
-      <button type="button" class="search-tab-pill ${currentTab === 'songs' ? 'active' : ''}" onclick="setSearchTab('songs')">🎵 Şarkılar (${tracks.length})</button>
-      <button type="button" class="search-tab-pill ${currentTab === 'videos' ? 'active' : ''}" onclick="setSearchTab('videos')">🎬 Video Klipler (${videos.length})</button>
+  results.innerHTML = `
+    <div class="section-header" style="margin-top: 16px;">
+      <h2 class="section-title">Şarkı Sonuçları</h2>
+      <span class="section-see-all">${tracks.length} şarkı</span>
     </div>
-  `;
-
-  // 1. Tümü Sekmesi: Önce video klipler, ardından şarkılar
-  if (currentTab === 'all') {
-    if (videos.length > 0) {
-      const topVideos = videos.slice(0, 4);
-      html += `
-        <div class="section-header" style="margin-top: 16px;">
-          <h2 class="section-title">🎬 En İyi Video Klipler</h2>
-          <span class="section-see-all" style="cursor:pointer;" onclick="setSearchTab('videos')">Tüm klipleri gör (${videos.length}) &rarr;</span>
-        </div>
-        <div class="search-video-highlight-grid">
-          ${topVideos.map(v => renderSearchVideoCard(v)).join('')}
-        </div>
-      `;
-    }
-    if (tracks.length > 0) {
-      html += `
-        <div class="section-header" style="margin-top: 24px;">
-          <h2 class="section-title">🎵 Şarkılar</h2>
-          <span class="section-see-all">${tracks.length} şarkı</span>
-        </div>
-        <div class="track-list">
-          <div class="track-list-header"><span>#</span><span>Başlık</span><span>Albüm</span><span>İşlemler & Süre</span></div>
-          ${tracks.map((t, i) => renderTrackListItem(t, i, 'search')).join('')}
-        </div>
-      `;
-    }
-  } else if (currentTab === 'songs') {
-    if (tracks.length === 0) {
-      html += `<div class="empty-state"><p class="empty-state-text">Şarkı bulunamadı.</p></div>`;
-    } else {
-      html += `
-        <div class="section-header" style="margin-top: 16px;">
-          <h2 class="section-title">🎵 Şarkı Sonuçları</h2>
-          <span class="section-see-all">${tracks.length} şarkı</span>
-        </div>
-        <div class="track-list">
-          <div class="track-list-header"><span>#</span><span>Başlık</span><span>Albüm</span><span>İşlemler & Süre</span></div>
-          ${tracks.map((t, i) => renderTrackListItem(t, i, 'search')).join('')}
-        </div>
-      `;
-    }
-  } else if (currentTab === 'videos') {
-    if (videos.length === 0) {
-      html += `<div class="empty-state"><p class="empty-state-text">Video klip bulunamadı.</p></div>`;
-    } else {
-      html += `
-        <div class="section-header" style="margin-top: 16px;">
-          <h2 class="section-title">🎬 Tüm Video Klipler</h2>
-          <span class="section-see-all">${videos.length} video klip</span>
-        </div>
-        <div class="video-grid" style="margin-top: 16px;">
-          ${videos.map((v, i) => `
-            <div class="video-card" onclick='openVideoPlayerByIndexDirect(${i})'>
-              <div class="video-card-thumb-wrap">
-                <img class="video-card-thumb" src="${v.thumbnail}" alt="${escapeHtml(v.title)}" loading="lazy" onerror="this.src='${getDefaultArtwork()}'">
-                <div class="video-card-overlay">
-                  <div class="video-play-btn-circle">
-                    <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                  </div>
-                </div>
-                <span class="video-card-hd-badge">HD</span>
-                <span class="video-card-duration">${v.duration || '03:45'}</span>
-              </div>
-              <div class="video-card-info">
-                <h4 class="video-card-title">${escapeHtml(v.title)}</h4>
-                <span class="video-card-channel">${escapeHtml(v.channel)}</span>
-                <span class="video-card-meta">${v.views || 'YouTube'}</span>
-              </div>
-            </div>
-          `).join('')}
-        </div>
-      `;
-    }
-  }
-
-  rd.innerHTML = html;
-}
-
-function openVideoPlayerByIndexDirect(idx) {
-  const v = state.searchVideos && state.searchVideos[idx];
-  if (v) openVideoPlayer(v);
-}
-
-function renderSearchVideoCard(v) {
-  const vJson = JSON.stringify(v).replace(/"/g, '&quot;');
-  return `
-    <div class="search-video-card" onclick="openVideoPlayer(${vJson})">
-      <div class="search-video-thumb-wrap">
-        <img class="search-video-thumb" src="${v.thumbnail}" alt="${escapeHtml(v.title)}" loading="lazy" onerror="this.src='${getDefaultArtwork()}'">
-        <div class="search-video-overlay">
-          <div class="search-video-play-icon">
-            <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-          </div>
-        </div>
-        <span class="search-video-badge">🎬 KLİP</span>
-      </div>
-      <div class="search-video-info">
-        <h4 class="search-video-title">${escapeHtml(v.title)}</h4>
-        <span class="search-video-artist">${escapeHtml(v.channel)}</span>
-      </div>
-    </div>
-  `;
+    <div class="track-list">
+      <div class="track-list-header"><span>#</span><span>Başlık</span><span>Albüm</span><span>İşlemler & Süre</span></div>
+      ${tracks.map((track, index) => renderTrackListItem(track, index, 'search')).join('')}
+    </div>`;
 }
 function populateSearchGenres() {
   const grid=document.getElementById('searchGenreGrid'); if(!grid) return;
@@ -813,69 +634,85 @@ function renderTrackCard(track,index,gridId) {
   const il=state.likedSongs.some(s=>s.id===track.id);
   const likeFill = il ? 'currentColor' : 'none';
   const trackIdStr = String(track.id).replace(/'/g, "\\'");
-  return `<div class="track-card ${ip?'playing':''}" onclick="playFromGrid('${gridId}',${index})" data-track-id="${track.id}"><div class="track-card-art"><img src="${track.artwork}" alt="${escapeHtml(track.name)}" loading="lazy" onerror="this.src='${getDefaultArtwork()}'"><button class="track-card-play" onclick="event.stopPropagation();playFromGrid('${gridId}',${index})">${ip?'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>':'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'}</button><button class="card-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')"><svg viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button></div><div class="track-card-info"><div class="track-card-name">${escapeHtml(track.name)}</div><div class="track-card-artist">${escapeHtml(track.artist)}</div></div></div>`;
+  return `<div class="track-card ${ip?'playing':''}" onclick="playFromGrid('${gridId}',${index})" data-track-id="${track.id}"><div class="track-card-art"><img src="${track.artwork}" alt="${escapeHtml(track.name)}" loading="lazy" onerror="this.src=getDefaultArtwork()"><button class="track-card-play" onclick="event.stopPropagation();playFromGrid('${gridId}',${index})">${ip?'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>':'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'}</button><button class="card-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')"><svg viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button></div><div class="track-card-info"><div class="track-card-name">${escapeHtml(track.name)}</div><div class="track-card-artist">${escapeHtml(track.artist)}</div></div></div>`;
 }
-function renderTrackListItem(track,index, context = 'playlist') {
-  const ip=state.currentTrack&&state.currentTrack.id===track.id;
-  const il=state.likedSongs.some(s=>s.id===track.id);
-  const d=formatTime(track.duration);
-  const isPlayingIcon = ip&&state.isPlaying ? '<div class="equalizer"><div class="equalizer-bar"></div><div class="equalizer-bar"></div><div class="equalizer-bar"></div><div class="equalizer-bar"></div></div>' : '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
-  const likeFill = il ? 'currentColor' : 'none';
-  const trackIdStr = String(track.id).replace(/'/g, "\\'");
-  const artistEsc = escapeHtml(track.artist || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\r\n]/g, ' ');
-  const nameEsc = escapeHtml(track.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\r\n]/g, ' ');
-  return `<div class="track-list-item ${ip?'playing':''}" onclick="playFromContext('${context}', ${index})" data-track-id="${track.id}"><div><span class="track-list-number">${index+1}</span><span class="track-list-play-icon">${isPlayingIcon}</span></div><div class="track-list-info"><div class="track-list-art"><img src="${track.artworkSmall||track.artwork}" alt="" loading="lazy" onerror="this.src='${getDefaultArtwork()}'"></div><div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name)}</div><div class="track-list-artist">${escapeHtml(track.artist)}</div></div></div><div class="track-list-album">${escapeHtml(track.album||'')}</div><div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;"><button class="track-video-btn" onclick="event.stopPropagation();openTrackVideo(${artistEsc}, ${nameEsc}, '${trackIdStr}')" title="Klibi İzle 🎬"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg><span>Klip</span></button><button class="track-like-btn ${il?'liked':''}" onclick="event.stopPropagation();toggleLikeById('${trackIdStr}')" title="Beğen"><svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 3?"/></svg></button><span class="track-list-duration">${d}</span></div></div>`;
+function renderYouTubeTrendingList(tracks) {
+  return `<div class="yt-trend-cards">
+    ${tracks.map((track, index) => {
+      const isPlaying = state.currentTrack?.id === track.id && state.isPlaying;
+      const isLiked = state.likedSongs.some((song) => String(song.id) === String(track.id));
+      const likeFill = isLiked ? 'currentColor' : 'none';
+      const safeId = String(track.id).replace(/[^\w-]/g, '');
+      const artwork = escapeHtml(track.artwork || track.artworkSmall || getDefaultArtwork());
+      return `<div class="yt-trend-card ${isPlaying ? 'playing' : ''}" onclick="playFromContext('youtubeTrending', ${index})" data-track-id="${safeId}">
+        <div class="yt-trend-card-art">
+          <img src="${artwork}" alt="${escapeHtml(track.name)}" loading="lazy" onerror="this.src=getDefaultArtwork()">
+          <div class="yt-trend-card-rank">${index + 1}</div>
+          <button class="yt-trend-card-play" onclick="event.stopPropagation();playFromContext('youtubeTrending', ${index})">
+            ${isPlaying
+              ? '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>'
+              : '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'}
+          </button>
+        </div>
+        <div class="yt-trend-card-body">
+          <div class="yt-trend-card-name" title="${escapeHtml(track.name)}">${escapeHtml(track.name)}</div>
+          <div class="yt-trend-card-artist" title="${escapeHtml(track.artist)}">${escapeHtml(track.artist)}</div>
+          <div class="yt-trend-card-meta">
+            <span class="yt-badge-yt">YouTube</span>
+            ${track.duration ? `<span class="yt-trend-dur">${formatTime(track.duration)}</span>` : ''}
+          </div>
+        </div>
+        <button class="yt-trend-card-like ${isLiked ? 'liked' : ''}" onclick="event.stopPropagation();toggleLikeById('${safeId}')" title="Begen">
+          <svg viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+        </button>
+      </div>`;
+    }).join('')}
+  </div>`;
 }
+function renderTrackListItem(track, index, context = 'playlist') {
+  const isPlaying = state.currentTrack && state.currentTrack.id === track.id;
+  const isLiked = state.likedSongs.some((song) => String(song.id) === String(track.id));
+  const duration = Number(track.duration) > 0 ? formatTime(Number(track.duration)) : '—';
+  const playIndicator = isPlaying && state.isPlaying
+    ? '<div class="equalizer"><div class="equalizer-bar"></div><div class="equalizer-bar"></div><div class="equalizer-bar"></div><div class="equalizer-bar"></div></div>'
+    : '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+  const trackId = String(track.id || '').replace(/[^\w-]/g, '');
+  const artwork = escapeHtml(track.artworkSmall || track.artwork || getDefaultArtwork());
+  const likeFill = isLiked ? 'currentColor' : 'none';
+
+  return `<div class="track-list-item ${isPlaying ? 'playing' : ''}" onclick="playFromContext('${context}', ${index})" data-track-id="${trackId}">
+    <div><span class="track-list-number">${index + 1}</span><span class="track-list-play-icon">${playIndicator}</span></div>
+    <div class="track-list-info">
+      <div class="track-list-art"><img src="${artwork}" alt="" loading="lazy" onerror="this.src=getDefaultArtwork()"></div>
+      <div class="track-list-text"><div class="track-list-name">${escapeHtml(track.name || 'Bilinmeyen Şarkı')}</div><div class="track-list-artist">${escapeHtml(track.artist || 'Bilinmeyen Sanatçı')}</div></div>
+    </div>
+    <div class="track-list-album">${escapeHtml(track.album || '')}</div>
+    <div class="track-list-actions">
+      <button class="track-like-btn ${isLiked ? 'liked' : ''}" onclick="event.stopPropagation();toggleLikeById('${trackId}')" title="Beğen" aria-label="${isLiked ? 'Beğenilenlerden çıkar' : 'Beğen'}">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="${likeFill}" stroke="currentColor" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      </button>
+      <span class="track-list-duration">${duration}</span>
+    </div>
+  </div>`;
+}
+
 function playFromContext(context, idx) {
-  if (context === 'search' || context === 'playlist') state.queue = [...state.currentPlaylistTracks];
-  else if (context === 'liked') state.queue = [...state.likedSongs];
-  else if (context === 'mySongs') state.queue = [...state.mySongs];
-  state.queueIndex = idx; playTrack(state.queue[idx]);
+  const queues = {
+    search: state.currentPlaylistTracks,
+    playlist: state.currentPlaylistTracks,
+    youtubeTrending: state.youtubeTrendingTracks,
+    liked: state.likedSongs,
+    mySongs: state.mySongs
+  };
+  const tracks = queues[context];
+  if (!Array.isArray(tracks) || !Number.isInteger(idx) || idx < 0 || idx >= tracks.length) return;
+  state.queue = [...tracks];
+  state.queueIndex = idx;
+  playTrack(state.queue[idx]);
 }
 
-async function openTrackVideo(artist, name, trackId) {
-  const allTracks = [...(state.currentPlaylistTracks || []), ...(state.likedSongs || []), ...(state.mySongs || []), ...(state.recentlyPlayed || [])];
-  if (state.currentTrack) allTracks.push(state.currentTrack);
-  const track = allTracks.find(t => String(t.id) === String(trackId));
-
-  if (track && track.youtubeId) {
-    openVideoPlayer({
-      id: track.id,
-      youtubeId: track.youtubeId,
-      title: track.name,
-      channel: track.artist,
-      duration: 'HD',
-      thumbnail: track.artwork || track.artworkSmall,
-      views: 'YouTube'
-    });
-    return;
-  }
-
-  showToast(`"${name}" klibi aranıyor... 🎬`);
-  try {
-  const q = `${artist} ${name} official video clip`;
-  const results = await searchYouTube(q, 4);
-  if (results && results.length > 0) {
-      const candidates = results.map((item) => ({
-        id: item.id,
-        youtubeId: item.youtubeId,
-        title: item.name,
-        channel: item.artist,
-        duration: 'HD',
-        thumbnail: item.artwork || (track ? (track.artwork || track.artworkSmall) : getDefaultArtwork()),
-        views: 'YouTube'
-      }));
-      openVideoPlayer({ ...candidates[0], fallbackVideos: candidates.slice(1) });
-    } else {
-      showToast('Bu şarkı için video klip bulunamadı.');
-    }
-  } catch (err) {
-    console.warn('Video search error:', err);
-    showToast('Klip açılırken bir sorun oluştu.');
-  }
-}
 function toggleLikeById(id) {
-  const allTracks = [...state.currentPlaylistTracks, ...state.likedSongs, ...state.mySongs, ...state.recentlyPlayed];
+  const allTracks = [...state.youtubeTrendingTracks, ...state.currentPlaylistTracks, ...state.likedSongs, ...state.mySongs, ...state.recentlyPlayed];
   if (state.currentTrack) allTracks.push(state.currentTrack);
   const track = allTracks.find(t => String(t.id) === String(id));
   if (track) toggleLikeTrack(track);
@@ -1229,7 +1066,7 @@ function toggleLikeTrack(track) {
 function updateLikeButtons(trackId) {
   const isLiked = state.likedSongs.some(s => String(s.id) === String(trackId));
   const fill = isLiked ? 'currentColor' : 'none';
-  document.querySelectorAll(`[data-track-id="${trackId}"] .track-like-btn, [data-track-id="${trackId}"] .card-like-btn`).forEach(btn => {
+  document.querySelectorAll(`[data-track-id="${trackId}"] .track-like-btn, [data-track-id="${trackId}"] .card-like-btn, [data-track-id="${trackId}"] .youtube-trend-like`).forEach(btn => {
     btn.classList.toggle('liked', isLiked);
     const svg = btn.querySelector('svg');
     if (svg) svg.setAttribute('fill', fill);
@@ -1657,25 +1494,17 @@ async function initApp() {
   updateAudioModeUI();
   try { state.lyricOffsets = JSON.parse(localStorage.getItem('spoflix_lyric_offsets') || '{}'); } catch (error) { state.lyricOffsets = {}; }
   updateAccountUI();
-  await getAudiusHost();
   try { await initDatabase(); await loadMySongsFromDB(); } catch(e) { console.error('DB init failed:',e); }
-  document.getElementById('trendingGrid').innerHTML=renderSkeletonCards(8);
-  document.getElementById('turkeyTrendGrid').innerHTML=renderSkeletonCards(8);
-  document.getElementById('newReleasesGrid').innerHTML=renderSkeletonCards(8);
-  document.getElementById('recommendedGrid').innerHTML=renderSkeletonCards(8);
-  const turkeyLoad = getTurkishTrendingTracks(20).then((turkey) => {
-    window._gridData_turkeyTrendGrid = turkey;
-    const grid = document.getElementById('turkeyTrendGrid');
-    if (turkey.length) grid.innerHTML = turkey.map((track, index) => renderTrackCard(track, index, 'turkeyTrendGrid')).join('');
-    else grid.innerHTML = '<p style="color:var(--text-secondary);padding:20px;">Türkiye listesi şu anda yüklenemedi.</p>';
-  }).catch((e) => console.error('Türkiye trendleri yüklenemedi:', e));
-  try { const t=await getTrendingTracks('week',20); window._gridData_trendingGrid=t; const tg=document.getElementById('trendingGrid'); if(t.length>0) tg.innerHTML=t.map((t,i)=>renderTrackCard(t,i,'trendingGrid')).join(''); else tg.innerHTML='<p style="color:var(--text-secondary);padding:20px;">Yükleniyor...</p>'; } catch(e){console.error('Trending error:',e);}
-  try { const nr=await getTrendingTracks('month',20); window._gridData_newReleasesGrid=nr; const ng=document.getElementById('newReleasesGrid'); if(nr.length>0) ng.innerHTML=nr.map((t,i)=>renderTrackCard(t,i,'newReleasesGrid')).join(''); } catch(e){console.error('New releases error:',e);}
-  try { const rec=await getTrendingTracks('year',20); window._gridData_recommendedGrid=rec; const rg=document.getElementById('recommendedGrid'); if(rec.length>0) rg.innerHTML=rec.map((t,i)=>renderTrackCard(t,i,'recommendedGrid')).join(''); } catch(e){console.error('Recommended error:',e);}
+  const grid = document.getElementById('turkeyTrendGrid');
+  if (grid) grid.innerHTML = '<div class="loading-spinner"><div class="spinner"></div></div>';
+  state.youtubeTrendingTracks = await getYouTubeTrendingTracks(25);
+  if (grid) {
+    grid.innerHTML = state.youtubeTrendingTracks.length
+      ? renderYouTubeTrendingList(state.youtubeTrendingTracks)
+      : '<p class="youtube-trend-empty">YouTube Türkiye trendleri şu anda yüklenemedi.</p>';
+  }
   updateLikedCountDisplay();
-  initVideoModule();
   applyVolumeSettings();
-  await turkeyLoad;
 }
 document.addEventListener('keydown',(e)=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
@@ -1754,7 +1583,7 @@ function onYouTubeIframeAPIReady() {
         clearInterval(ytTimeInterval);
         state.isPlaying = false;
         updatePlayerUI();
-        showToast('Bu YouTube videosu oynatılamıyor. Başka bir sonuç seç.');
+        showToast('Bu şarkı YouTube üzerinden oynatılamıyor. Başka bir şarkı seç.');
       }
     }
   });
@@ -1774,6 +1603,10 @@ function onYouTubeIframeAPIReady() {
 }
 
 function onYtPlayerStateChange(event) {
+  const expectedVideoId = state.currentTrack?.youtubeId;
+  const eventVideoId = event.target?.getVideoData?.().video_id;
+  if (!expectedVideoId || (eventVideoId && eventVideoId !== expectedVideoId)) return;
+
   if (event.data === YT.PlayerState.PLAYING) {
     state.audioReady = true;
     state.isPlaying = true;
@@ -1820,36 +1653,6 @@ function playTrack(track) {
     return;
   }
   pendingYoutubeTrack = null;
-
-  if (['apple-tr', 'apple-tr-fallback', 'turkish-featured'].includes(track.source)) {
-    const lookupToken = ++state.playToken;
-    stopCurrentPlayback();
-    state.currentTrack = track;
-    state.playbackMode = 'youtube';
-    state.trackStartTime = Date.now();
-    state.lyricLines = [];
-    state.lyricTrackId = track.id;
-    state.activeLyricIndex = -1;
-    updatePlayerUI();
-    updatePlayingStates();
-    showToast(`YouTube'da "${track.name}" aranıyor...`);
-    (async () => {
-      const query = `${track.name} ${track.artist}`;
-      const matches = await searchYouTube(query, 10);
-      if (lookupToken !== state.playToken) return;
-      const target = String(track.name).toLocaleLowerCase('tr-TR').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-      const playable = matches.find((item) => {
-        const name = String(item.name).toLocaleLowerCase('tr-TR').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-        return name.includes(target) || target.includes(name);
-      }) || matches[0];
-      if (playable?.youtubeId) {
-        playTrack({ ...track, previewUrl: '', youtubeId: playable.youtubeId, source: 'youtube' });
-      } else {
-        showToast('YouTube sonucu bulunamadı. Biraz sonra tekrar dene.');
-      }
-    })();
-    return;
-  }
 
   // Her çağrıya benzersiz bir "token" ver. audio.play() gibi asenkron
   // işlemler tamamlandığında token hala en güncel mi diye kontrol edilecek.
@@ -2071,664 +1874,3 @@ document.addEventListener('visibilitychange', () => {
     }
   }
 });
-
-// ============================================
-// SPOFLIX - VİDEOLAR & VİDEO İZLEME SİSTEMİ
-// ============================================
-
-const CURATED_VIDEOS = [
-  {
-    id: 'vid_1',
-    youtubeId: 'qS9hXp_H3hA',
-    title: 'Tarkan - Şımarık (Official Video 4K)',
-    channel: 'Tarkan',
-    duration: '03:55',
-    category: 'turkish',
-    views: '88M izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=700&q=80',
-    desc: 'Türk pop müziğinin zamansız efsanesi Tarkan’ın tüm dünyayı sallayan klibi.'
-  },
-  {
-    id: 'vid_2',
-    youtubeId: '4NRXx6U8ABQ',
-    title: 'The Weeknd - Blinding Lights (Official Music Video)',
-    channel: 'The Weeknd',
-    duration: '04:22',
-    category: 'trend',
-    views: '840M izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1508700115892-45ecd05ae2ad?auto=format&fit=crop&w=700&q=80',
-    desc: 'Dünya listelerini altüst eden synth-pop şaheseri.'
-  },
-  {
-    id: 'vid_3',
-    youtubeId: 'oygrmJFKYZY',
-    title: 'Dua Lipa - Don\'t Start Now (Official Music Video)',
-    channel: 'Dua Lipa',
-    duration: '03:03',
-    category: 'global',
-    views: '690M izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&w=700&q=80',
-    desc: 'Disko ritimleri ve büyüleyici görsel yönetmenlik.'
-  },
-  {
-    id: 'vid_4',
-    youtubeId: 'eVTXPUF4Oz4',
-    title: 'Linkin Park - In The End (Official 4K Remastered)',
-    channel: 'Linkin Park',
-    duration: '03:38',
-    category: 'live',
-    views: '1.7B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1465847899084-d164df4dedc6?auto=format&fit=crop&w=700&q=80',
-    desc: 'Rock tarihinin en unutulmaz video kliplerinden biri.'
-  },
-  {
-    id: 'vid_5',
-    youtubeId: '09R8_2nJtjg',
-    title: 'Maroon 5 - Sugar (Official Music Video)',
-    channel: 'Maroon 5',
-    duration: '05:01',
-    category: 'trend',
-    views: '4.0B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1493225457124-cac612d2d12f?auto=format&fit=crop&w=700&q=80',
-    desc: 'Düğünleri basan Maroon 5 ve unutulmaz anlar.'
-  },
-  {
-    id: 'vid_6',
-    youtubeId: 'JGwWNGJdvx8',
-    title: 'Ed Sheeran - Shape of You (Official Music Video)',
-    channel: 'Ed Sheeran',
-    duration: '04:23',
-    category: 'global',
-    views: '6.2B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=700&q=80',
-    desc: 'Tüm zamanların en çok izlenen pop kliplerinden biri.'
-  },
-  {
-    id: 'vid_7',
-    youtubeId: '7wtfhZwyrcc',
-    title: 'Imagine Dragons - Believer (Official Music Video)',
-    channel: 'Imagine Dragons',
-    duration: '03:36',
-    category: 'trend',
-    views: '2.5B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1501386761578-eac5c94b800a?auto=format&fit=crop&w=700&q=80',
-    desc: 'Yüksek enerjili vuruşlar ve aksiyon dolu sinematografi.'
-  },
-  {
-    id: 'vid_8',
-    youtubeId: 'uelHwf8o7_U',
-    title: 'Eminem ft. Rihanna - Love The Way You Lie',
-    channel: 'Eminem',
-    duration: '04:26',
-    category: 'rap',
-    views: '2.7B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1509198397868-475647b2a1e5?auto=format&fit=crop&w=700&q=80',
-    desc: 'Sinematik hip-hop başyapıtı.'
-  },
-  {
-    id: 'vid_9',
-    youtubeId: 'YQHsXMglC9A',
-    title: 'Adele - Hello (Official Music Video)',
-    channel: 'Adele',
-    duration: '06:06',
-    category: 'global',
-    views: '3.1B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1516450360452-9312f5e86fc7?auto=format&fit=crop&w=700&q=80',
-    desc: 'Xavier Dolan yönetmenliğinde çekilen ikonik melankolik klip.'
-  },
-  {
-    id: 'vid_10',
-    youtubeId: 'RgKAFK5djSk',
-    title: 'Wiz Khalifa ft. Charlie Puth - See You Again',
-    channel: 'Wiz Khalifa',
-    duration: '03:57',
-    category: 'rap',
-    views: '6.1B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1518609878373-06d740f60d8b?auto=format&fit=crop&w=700&q=80',
-    desc: 'Hızlı ve Öfkeli serisinin efsaneleşen anma şarkısı.'
-  },
-  {
-    id: 'vid_11',
-    youtubeId: 'OPf0YbXqDm0',
-    title: 'Mark Ronson ft. Bruno Mars - Uptown Funk',
-    channel: 'Mark Ronson',
-    duration: '04:30',
-    category: 'trend',
-    views: '4.9B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1429962714451-bb934ecdc4ec?auto=format&fit=crop&w=700&q=80',
-    desc: 'Sokak dansları ve saf funk enerjisi.'
-  },
-  {
-    id: 'vid_12',
-    youtubeId: 'hT_nvWreIhg',
-    title: 'OneRepublic - Counting Stars (Official Music Video)',
-    channel: 'OneRepublic',
-    duration: '04:43',
-    category: 'trend',
-    views: '3.9B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1511379938547-c1f69419868d?auto=format&fit=crop&w=700&q=80',
-    desc: 'Ritmiyle büyüleyen küresel pop-rock klasiği.'
-  },
-  {
-    id: 'vid_13',
-    youtubeId: 'nfWlot6h_JM',
-    title: 'Taylor Swift - Shake It Off (Official Video)',
-    channel: 'Taylor Swift',
-    duration: '04:01',
-    category: 'global',
-    views: '3.4B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1520523839898-507125cd53c1?auto=format&fit=crop&w=700&q=80',
-    desc: 'Eğlenceli koreografiler ve renkli pop gösterisi.'
-  },
-  {
-    id: 'vid_14',
-    youtubeId: 'CevxZvSJLk8',
-    title: 'Katy Perry - Roar (Official Video)',
-    channel: 'Katy Perry',
-    duration: '04:30',
-    category: 'global',
-    views: '3.8B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1506157786151-b8491531f063?auto=format&fit=crop&w=700&q=80',
-    desc: 'Ormanda hayatta kalma temalı eğlenceli ve renkli klip.'
-  },
-  {
-    id: 'vid_15',
-    youtubeId: 'fJ9rUzIMcZQ',
-    title: 'Queen - Bohemian Rhapsody (Official Video)',
-    channel: 'Queen Official',
-    duration: '06:00',
-    category: 'live',
-    views: '1.7B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1498038432885-c6f3f1b912ee?auto=format&fit=crop&w=700&q=80',
-    desc: 'Tarihin ilk modern müzik videosu.'
-  },
-  {
-    id: 'vid_16',
-    youtubeId: 'V1Pl8CzNzCw',
-    title: 'Billie Eilish - bad guy (Official Music Video)',
-    channel: 'Billie Eilish',
-    duration: '03:25',
-    category: 'trend',
-    views: '1.2B izlenme',
-    thumbnail: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=700&q=80',
-    desc: 'Yenilikçi, çılgın ve ödüllü pop klasiği.'
-  }
-];
-
-function initVideoModule() {
-  state.videoList = [...CURATED_VIDEOS];
-  renderVideoCategory('all');
-}
-
-function renderVideoCategory(cat = 'all') {
-  state.currentVideoCategory = cat;
-  
-  document.querySelectorAll('.video-pill').forEach(pill => {
-    pill.classList.toggle('active', pill.dataset.vcat === cat);
-  });
-
-  let filtered = CURATED_VIDEOS;
-  if (cat !== 'all') {
-    filtered = CURATED_VIDEOS.filter(v => v.category === cat);
-  }
-  
-  renderVideoGrid(filtered);
-}
-
-function filterVideoCategory(cat) {
-  renderVideoCategory(cat);
-}
-
-function renderVideoGrid(videos) {
-  const container = document.getElementById('videoGrid');
-  if (!container) return;
-
-  if (!videos || videos.length === 0) {
-    container.innerHTML = `
-      <div style="grid-column: 1 / -1; text-align: center; padding: 60px 20px; color: var(--text-secondary);">
-        <div style="font-size: 48px; margin-bottom: 12px;">🎬</div>
-        <h3 style="color: #fff; font-size: 18px; margin-bottom: 6px;">Aradığınız video bulunamadı</h3>
-        <p style="font-size: 13px;">Farklı bir kelime arayabilir veya YouTube üzerinden tüm videoları keşfedebilirsiniz.</p>
-      </div>
-    `;
-    return;
-  }
-
-  container.innerHTML = videos.map((v, i) => {
-    const isPlayingThis = state.currentVideo && state.currentVideo.youtubeId === v.youtubeId;
-    return `
-      <div class="video-card ${isPlayingThis ? 'active' : ''}" onclick="openVideoPlayerByIndex(${i})">
-        <div class="video-card-thumb-wrap">
-          <img class="video-card-thumb" src="${v.thumbnail}" alt="${escapeHtml(v.title)}" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=600&q=80'">
-          <div class="video-card-overlay">
-            <div class="video-play-btn-circle">
-              <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-            </div>
-          </div>
-          <span class="video-card-hd-badge">HD 1080P</span>
-          <span class="video-card-duration">${v.duration || '03:45'}</span>
-        </div>
-        <div class="video-card-info">
-          <h4 class="video-card-title">${escapeHtml(v.title)}</h4>
-          <span class="video-card-channel">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
-            ${escapeHtml(v.channel)}
-          </span>
-          <span class="video-card-meta">${v.views || 'Trend Klip'}</span>
-        </div>
-      </div>
-    `;
-  }).join('');
-}
-
-function handleVideoSearchInput(query) {
-  clearTimeout(state.videoSearchTimeout);
-  const q = query.trim().toLowerCase();
-  
-  if (!q) {
-    renderVideoCategory(state.currentVideoCategory || 'all');
-    return;
-  }
-
-  state.videoSearchTimeout = setTimeout(async () => {
-    const localMatches = CURATED_VIDEOS.filter(v => 
-      v.title.toLowerCase().includes(q) || 
-      v.channel.toLowerCase().includes(q) ||
-      (v.desc && v.desc.toLowerCase().includes(q))
-    );
-
-    if (localMatches.length > 0) {
-      renderVideoGrid(localMatches);
-    } else {
-      // YouTube arama API fallback
-      showToast('YouTube videoları taranıyor...');
-      try {
-        const ytResults = await searchYouTube(q, 12);
-        if (ytResults && ytResults.length > 0) {
-          const mappedYt = ytResults.map(item => ({
-            id: item.id,
-            youtubeId: item.youtubeId,
-            title: item.name,
-            channel: item.artist,
-            duration: 'HD',
-            category: 'search',
-            views: 'YouTube',
-            thumbnail: item.artwork || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=600&q=80',
-            desc: item.name
-          }));
-          renderVideoGrid(mappedYt);
-          state.videoList = mappedYt;
-        } else {
-          renderVideoGrid([]);
-        }
-      } catch (err) {
-        console.warn('Video search error:', err);
-        renderVideoGrid([]);
-      }
-    }
-  }, 350);
-}
-
-function searchAndFilterVideos(term) {
-  navigateTo('videos');
-  const input = document.getElementById('videoSearchInput');
-  if (input) {
-    input.value = term;
-    handleVideoSearchInput(term);
-  }
-}
-
-function playHeroVideo() {
-  const heroVideo = CURATED_VIDEOS[0];
-  if (heroVideo) openVideoPlayer(heroVideo);
-}
-
-function openVideoPlayerByIndex(index) {
-  const video = (state.videoList && state.videoList[index]) || CURATED_VIDEOS[index];
-  if (video) openVideoPlayer(video);
-}
-
-let youtubeIframeApiPromise = null;
-
-function loadYouTubeIframeAPI() {
-  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
-  if (youtubeIframeApiPromise) return youtubeIframeApiPromise;
-
-  youtubeIframeApiPromise = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      youtubeIframeApiPromise = null;
-      reject(new Error('YouTube oynatıcı zaman aşımına uğradı.'));
-    }, 15000);
-
-    const previousReady = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => {
-      if (typeof previousReady === 'function') {
-        try { previousReady(); } catch (e) { console.warn('YouTube ses oynatıcı başlatılamadı:', e); }
-      }
-      clearTimeout(timeout);
-      if (window.YT && window.YT.Player) resolve(window.YT);
-      else {
-        youtubeIframeApiPromise = null;
-        reject(new Error('YouTube oynatıcı yüklenemedi.'));
-      }
-    };
-
-    const fail = () => {
-      clearTimeout(timeout);
-      youtubeIframeApiPromise = null;
-      reject(new Error('YouTube oynatıcı yüklenemedi.'));
-    };
-    const existingScript = document.querySelector('script[src="https://www.youtube.com/iframe_api"]');
-    if (existingScript) {
-      existingScript.addEventListener('error', fail, { once: true });
-    } else {
-      const script = document.createElement('script');
-      script.src = 'https://www.youtube.com/iframe_api';
-      script.async = true;
-      script.onerror = fail;
-      document.head.appendChild(script);
-    }
-  });
-
-  return youtubeIframeApiPromise;
-}
-
-function destroyCurrentVideoPlayer() {
-  const player = state.currentVideoPlayer;
-  state.currentVideoPlayer = null;
-  if (player && typeof player.destroy === 'function') {
-    try { player.destroy(); } catch (e) {}
-  }
-}
-
-function openVideoUnavailable(container, video, errorCode) {
-  if (!container || !video) return;
-  const youtubeId = String(video.youtubeId || '').replace(/[^\w-]/g, '');
-  const explanation = errorCode === 101 || errorCode === 150
-    ? 'Bu klibin sahibi uygulama içinden oynatılmasına izin vermiyor.'
-    : errorCode === 153
-      ? 'YouTube oynatıcı kimliği doğrulanamadı.'
-      : 'Bu klip şu anda uygulama içinde oynatılamıyor.';
-
-  container.innerHTML = `
-    <div class="video-playback-fallback">
-      <div class="video-playback-fallback-content">
-        <span class="video-playback-fallback-icon">▶</span>
-        <h3>Video açılamadı</h3>
-        <p>${explanation}</p>
-        <a class="video-playback-fallback-link" href="https://www.youtube.com/watch?v=${youtubeId}" onclick="openVideoOnYouTube('${youtubeId}'); return false;">YouTube'da izle</a>
-      </div>
-    </div>
-  `;
-}
-
-function openVideoOnYouTube(videoId) {
-  const safeId = String(videoId || '').replace(/[^\w-]/g, '');
-  if (!safeId) return;
-  const url = `https://www.youtube.com/watch?v=${safeId}`;
-  try {
-    if (window.require) {
-      const electronApi = window.require('electron');
-      if (electronApi?.shell?.openExternal) {
-        electronApi.shell.openExternal(url).catch(() => window.open(url, '_blank', 'noopener'));
-        return;
-      }
-    }
-  } catch (e) {}
-  window.open(url, '_blank', 'noopener');
-}
-
-function handleVideoPlayerError(errorCode, token, container) {
-  if (token !== state.videoPlaybackToken) return;
-  const current = state.currentVideo;
-  const attemptedIds = new Set([...(current?.attemptedYoutubeIds || []), current?.youtubeId].filter(Boolean));
-  const fallback = (current && Array.isArray(current.fallbackVideos) ? current.fallbackVideos : [])
-    .filter((video) => video?.youtubeId && !attemptedIds.has(video.youtubeId));
-
-  // Track clip searches often return alternate uploads of the same clip.
-  // Try those automatically for video-specific errors; player configuration
-  // errors (such as 153) need a user-visible recovery link instead.
-  if ([100, 101, 150].includes(errorCode) && fallback.length > 0) {
-    const [next, ...remaining] = fallback;
-    showToast('Bu klip açılamadı; başka bir video deneniyor...');
-    setTimeout(() => {
-      if (token === state.videoPlaybackToken) {
-        openVideoPlayer({
-          ...next,
-          fallbackVideos: remaining,
-          attemptedYoutubeIds: [...attemptedIds],
-          fallbackSearchAttempted: Boolean(current?.fallbackSearchAttempted)
-        });
-      }
-    }, 350);
-    return;
-  }
-
-  if ([100, 101, 150].includes(errorCode) && current?.title && !current.fallbackSearchAttempted) {
-    current.fallbackSearchAttempted = true;
-    showToast('Bu klip açılmadı; oynatılabilir başka bir yükleme aranıyor...');
-    const query = `${current.title} ${current.channel || ''} official video`;
-    searchYouTube(query, 10).then((results) => {
-      if (token !== state.videoPlaybackToken) return;
-      const candidates = results
-        .filter((item) => item.youtubeId && !attemptedIds.has(item.youtubeId))
-        .map((item) => ({
-          id: item.id,
-          youtubeId: item.youtubeId,
-          title: item.name,
-          channel: item.artist,
-          duration: 'HD',
-          thumbnail: item.artwork || current.thumbnail || getDefaultArtwork(),
-          views: 'YouTube'
-        }));
-      if (candidates.length) {
-        const [next, ...remaining] = candidates;
-        openVideoPlayer({
-          ...next,
-          fallbackVideos: remaining,
-          attemptedYoutubeIds: [...attemptedIds],
-          fallbackSearchAttempted: true
-        });
-      } else {
-        openVideoUnavailable(container, current, errorCode);
-      }
-    }).catch(() => openVideoUnavailable(container, current, errorCode));
-    return;
-  }
-
-  openVideoUnavailable(container, current, errorCode);
-}
-
-function openVideoPlayer(video) {
-  if (!video) return;
-  const token = ++state.videoPlaybackToken;
-  destroyCurrentVideoPlayer();
-  state.currentVideo = video;
-
-  // Arka plandaki müzik sesini durdur
-  if (state.isPlaying) {
-    audio.pause();
-    state.isPlaying = false;
-    updatePlayerUI();
-  }
-
-  // Mini oynatıcı açıksa kapat
-  closeMiniVideoPlayer(false);
-
-  const modal = document.getElementById('videoModal');
-  const container = document.getElementById('videoIframeContainer');
-  const modalTitle = document.getElementById('videoModalTitle');
-  const modalChannel = document.getElementById('videoModalChannel');
-  const stageTitle = document.getElementById('videoStageTitle');
-  const stageChannel = document.getElementById('videoStageChannel');
-  const sidebarList = document.getElementById('videoSidebarList');
-  const sidebarCount = document.getElementById('videoSidebarCount');
-
-  if (modalTitle) modalTitle.textContent = video.title;
-  if (modalChannel) modalChannel.textContent = video.channel;
-  if (stageTitle) stageTitle.textContent = video.title;
-  if (stageChannel) stageChannel.textContent = video.channel;
-
-  // Responsive 16:9 YouTube Embed Player
-  if (container) {
-    const origin = window.location.origin || 'http://localhost:45678';
-    container.innerHTML = `
-      <iframe 
-        id="activeVideoIframe"
-        src="https://www.youtube.com/embed/${video.youtubeId}?autoplay=1&enablejsapi=1&rel=0&playsinline=1&origin=${encodeURIComponent(origin)}" 
-        title="${escapeHtml(video.title)}" 
-        referrerpolicy="origin"
-        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
-        allowfullscreen>
-      </iframe>
-    `;
-
-    loadYouTubeIframeAPI().then((YT) => {
-      if (token !== state.videoPlaybackToken || !document.getElementById('activeVideoIframe')) return;
-      const player = new YT.Player('activeVideoIframe', {
-        events: {
-          onReady: (event) => event.target.playVideo(),
-          onError: (event) => handleVideoPlayerError(event.data, token, container)
-        }
-      });
-      state.currentVideoPlayer = player;
-      const playerCreatedAt = Date.now();
-      let lastProgressAt = playerCreatedAt;
-      let lastPlaybackTime = 0;
-      const monitorPlayback = () => {
-        if (token !== state.videoPlaybackToken || state.currentVideoPlayer !== player) return;
-        try {
-          const playbackTime = Number(player.getCurrentTime()) || 0;
-          if (playbackTime > lastPlaybackTime + 0.25) {
-            lastPlaybackTime = playbackTime;
-            lastProgressAt = Date.now();
-          }
-          if (Date.now() - playerCreatedAt >= 20000 && Date.now() - lastProgressAt >= 12000) {
-            handleVideoPlayerError(101, token, container);
-            return;
-          }
-        } catch (e) {}
-        setTimeout(monitorPlayback, 2500);
-      };
-      setTimeout(monitorPlayback, 2500);
-    }).catch(() => {
-      if (token === state.videoPlaybackToken) openVideoUnavailable(container, video, 0);
-    });
-  }
-
-  // Sıradaki videolar listesi
-  if (sidebarList) {
-    const queue = CURATED_VIDEOS.filter(v => v.youtubeId !== video.youtubeId);
-    if (sidebarCount) sidebarCount.textContent = `${queue.length} video`;
-    sidebarList.innerHTML = queue.map(item => `
-      <div class="video-sidebar-item" onclick="openVideoPlayer(${JSON.stringify(item).replace(/"/g, '&quot;')})">
-        <div class="video-sidebar-thumb">
-          <img src="${item.thumbnail}" alt="" loading="lazy">
-        </div>
-        <div class="video-sidebar-info">
-          <span class="video-sidebar-name">${escapeHtml(item.title)}</span>
-          <span class="video-sidebar-channel">${escapeHtml(item.channel)} • ${item.duration}</span>
-        </div>
-      </div>
-    `).join('');
-  }
-
-  if (modal) {
-    modal.classList.add('open');
-    modal.setAttribute('aria-hidden', 'false');
-  }
-
-  showToast('🎬 ' + video.title + ' oynatılıyor');
-}
-
-function closeVideoPlayer() {
-  state.videoPlaybackToken++;
-  destroyCurrentVideoPlayer();
-  const modal = document.getElementById('videoModal');
-  const container = document.getElementById('videoIframeContainer');
-  if (container) container.innerHTML = '';
-  if (modal) {
-    modal.classList.remove('open');
-    modal.setAttribute('aria-hidden', 'true');
-  }
-}
-
-function minimizeVideoPlayer() {
-  if (!state.currentVideo) return;
-  const video = state.currentVideo;
-  closeVideoPlayer();
-
-  const miniPlayer = document.getElementById('videoMiniPlayer');
-  const miniContainer = document.getElementById('videoMiniFrameContainer');
-  const miniTitle = document.getElementById('videoMiniTitle');
-
-  if (miniTitle) miniTitle.textContent = video.title;
-  if (miniContainer) {
-    const origin = window.location.origin || 'http://localhost:45678';
-    miniContainer.innerHTML = `
-      <iframe 
-        src="https://www.youtube.com/embed/${video.youtubeId}?autoplay=1&enablejsapi=1&rel=0&playsinline=1&origin=${encodeURIComponent(origin)}" 
-        title="${escapeHtml(video.title)}" 
-        referrerpolicy="origin"
-        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
-        allowfullscreen>
-      </iframe>
-    `;
-  }
-  if (miniPlayer) miniPlayer.classList.add('show');
-}
-
-function restoreVideoPlayer() {
-  if (!state.currentVideo) return;
-  const video = state.currentVideo;
-  closeMiniVideoPlayer();
-  openVideoPlayer(video);
-}
-
-function closeMiniVideoPlayer(clearCurrent = true) {
-  const miniPlayer = document.getElementById('videoMiniPlayer');
-  const miniContainer = document.getElementById('videoMiniFrameContainer');
-  if (miniContainer) miniContainer.innerHTML = '';
-  if (miniPlayer) miniPlayer.classList.remove('show');
-  if (clearCurrent) state.currentVideo = null;
-}
-
-function toggleTheaterMode() {
-  const dialog = document.getElementById('videoModalDialog');
-  if (dialog) dialog.classList.toggle('theater-mode');
-}
-
-async function openCurrentTrackVideo() {
-  if (!state.currentTrack) {
-    navigateTo('videos');
-    playHeroVideo();
-    return;
-  }
-
-  const t = state.currentTrack;
-  showToast(`"${t.name}" klibi aranıyor... 🎬`);
-
-  // YouTube'da şarkı klibini ara
-  try {
-    const q = `${t.artist} ${t.name} official video`;
-    const results = await searchYouTube(q, 3);
-    if (results && results.length > 0) {
-      const candidates = results.map((item) => ({
-        id: item.id,
-        youtubeId: item.youtubeId,
-        title: item.name,
-        channel: item.artist,
-        duration: 'HD',
-        thumbnail: item.artwork || t.artwork,
-        views: 'YouTube'
-      }));
-      openVideoPlayer({ ...candidates[0], fallbackVideos: candidates.slice(1) });
-    } else {
-      showToast('Klip bulunamadı, Video kataloğu açılıyor.');
-      navigateTo('videos');
-    }
-  } catch (err) {
-    console.warn('Current track video search error:', err);
-    navigateTo('videos');
-  }
-}

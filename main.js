@@ -9,12 +9,6 @@ const path = require('path');
 const fs = require('fs');
 const { startServer } = require('./server');
 
-// Ses motoru ve iframe Web Audio API erişimi için Chromium bayrakları
-app.commandLine.appendSwitch('disable-site-isolation-trials');
-app.commandLine.appendSwitch('disable-features', 'OutOfProcessIframe');
-app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-app.commandLine.appendSwitch('disable-web-security');
-
 const PORT = 45678;
 
 let mainWindow = null;
@@ -33,10 +27,11 @@ function createWindow(url) {
     show: false,
     icon: getIconPath(),
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      webSecurity: false,
-      allowRunningInsecureContent: true
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true
     }
   });
 
@@ -106,9 +101,14 @@ function applyBoostToAllFrames(multiplier, mode) {
 }
 
 ipcMain.on('set-volume-boost', (event, data) => {
-  const mult = data?.multiplier || 1.0;
-  const mode = data?.mode || 'normal';
-  applyBoostToAllFrames(mult, mode);
+  if (!mainWindow || event.sender !== mainWindow.webContents) return;
+  const requestedMultiplier = Number(data?.multiplier);
+  const multiplier = Number.isFinite(requestedMultiplier)
+    ? Math.max(0, Math.min(2.5, requestedMultiplier))
+    : 1;
+  const modes = new Set(['normal', 'boost', 'bass', 'nightcore']);
+  const mode = modes.has(data?.mode) ? data.mode : 'normal';
+  applyBoostToAllFrames(multiplier, mode);
 });
 
 function getIconPath() {

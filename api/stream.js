@@ -6,10 +6,8 @@ const ALLOWED_HOSTS = [
   'altego.net',
   'deezer.com',
   'dzcdn.net',
-  'itunes.apple.com',
   'jamendo.com',
   'jamendo.net',
-  'mzstatic.com',
   'monophonic.digital',
   'shakespearetech.com',
   'soundhelix.com'

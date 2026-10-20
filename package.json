@@ -1,6 +1,6 @@
 {
   "name": "spoflix",
-  "version": "1.0.7",
+  "version": "1.0.9",
   "description": "SpoFlix - Müzik Dinle (Masaüstü Uygulaması)",
   "main": "main.js",
   "author": "SpoFlix",
@@ -27,8 +27,8 @@
       "style.css",
       "server.js",
       "main.js",
-      "package.json",
-      "local-secrets.json"
+      "preload.js",
+      "package.json"
     ],
     "win": {
       "target": [
